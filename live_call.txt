@@ -1,0 +1,7 @@
+17:16:13 DEBUG   sipbot.pyvoip_fixes: Патчи pyVoIP применены: ответ 200 OK на OPTIONS/NOTIFY/INFO/MESSAGE/SUBSCRIBE/REFER/UPDATE, устойчивая регистрация
+17:16:13 INFO    sipbot.phone: Запуск SIP-клиента: server=sip.evpanet.com:5060 user=503 my_ip=172.18.185.162 sip_port=5060 rtp=10000-10100
+17:16:13 DEBUG   sipbot.pyvoip_fixes: Ответ 200 OK на OPTIONS (Call-ID 5c1a75a85f0632fc0bdbb4a3745c5391@91.195.230.4:5060) -> ('sip.evpanet.com', 5060)
+17:16:13 DEBUG   sipbot.pyvoip_fixes: Регистрация успешна (Call-ID 6b86b273ff34fce19d6b804eff5a3f57@172.18.185.162:5060)
+17:16:13 INFO    sipbot: Статус регистрации: REGISTERED
+17:16:13 INFO    sipbot.phone: Набираю +79780481885 (INVITE sip:+79780481885@sip.evpanet.com)
+17:16:15 INFO    sipbot.phone: Входящий звонок: from={'raw': '"+79789836556" <sip:508@91.195.230.4>', 'tag': 'as293c7af3', 'address': '508@91.195.230.4', 'number': '508', 'caller': '+79789836556" ', 'host': '91.195.230.4'} call-id=02cbeaab73acbfda0705a1b706908168@91.195.230.4:5060

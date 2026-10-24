@@ -1,0 +1,67 @@
+﻿self, text: str) -> bytes:
+        """Синтезировать речь. озвращает WAV PCM 16-bit mono."""
+        payload = {
+            "model": self.tts_model,
+            "voice": self.tts_voice,
+            "input": text,
+            "response_format": "wav",
+        }
+        url = f"{self.base_url}/audio/speech"
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "Accept": "audio/wav,audio/*",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                wav_bytes = response.read()
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")[:500]
+            raise AiClientError(
+                f"HTTP {exc.code} {exc.reason}: {error_body}"
+            ) from exc
+        except Exception as exc:
+            raise AiClientError(f"шибка TTS: {exc}") from exc
+
+        logger.debug("TTS: %d байт", len(wav_bytes))
+        return wav_bytes
+
+    # ------------------------------------------------------------------
+    # тилиты
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_multipart(
+        fields: List[tuple],
+        file_name: str,
+        file_content_type: str,
+        file_data: bytes,
+        boundary: str,
+    ) -> bytes:
+        lines: List[bytes] = []
+        for key, value in fields:
+            lines.append(f"--{boundary}\\r\\n".encode())
+            lines.append(
+                f'Content-Disposition: form-data; name="{key}"\\r\\n\\r\\n'.encode()
+            )
+            lines.append(f"{value}\\r\\n".encode())
+        lines.append(f"--{boundary}\\r\\n".encode())
+        lines.append(
+            (
+                f'Content-Disposition: form-data; name="file"; '
+                f'filename="{file_name}"\\r\\n'
+            ).encode()
+        )
+        lines.append(f"Content-Type: {file_content_type}\\r\\n\\r\\n".encode())
+        lines.append(file_data)
+        lines.append(f"\\r\\n--{boundary}--\\r\\n".encode())
+        return b"".join(lines)
+
+
+__all__ = ["AiClient", "AiClientError", "ChatResponse"]
+

@@ -1,0 +1,3 @@
+18:00:19 INFO    sipbot.phone: Запуск SIP-клиента: server=sip.evpanet.com:5060 user=503 my_ip=172.18.185.162 sip_port=5060 rtp=10000-11000 max_lines=2
+18:00:19 INFO    sipbot: Статус регистрации: REGISTERED
+18:00:19 INFO    sipbot: Многоканальный приём входящих: bot=placeholder max_lines=2 record_dir=recordings

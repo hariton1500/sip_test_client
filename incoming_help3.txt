@@ -1,0 +1,11 @@
+usage: main.py incoming [-h] [--bot BOT] [--record-dir RECORD_DIR]
+                        [--max-lines MAX_LINES]
+
+options:
+  -h, --help            show this help message and exit
+  --bot BOT             обработчик: silence|echo|tone|placeholder|placeholder:
+                        <мс>|wav:<путь>[:loop]
+  --record-dir RECORD_DIR
+                        директория для записи всех входящих звонков
+  --max-lines MAX_LINES
+                        переопределить MAX_INCOMING_LINES

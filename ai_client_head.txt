@@ -1,0 +1,91 @@
+﻿"""OpenAI-совместимый клиент для ASR/LLM/TTS.
+
+аботает через стандартную библиотеку urllib, чтобы не зависеть от requests/httpx.
+оддерживает любые OpenAI-совместимые API, в том числе AiTunnel.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+import urllib.request
+import wave
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+from .audio_utils import SAMPLE_RATE
+
+logger = logging.getLogger(__name__)
+PathLike = Union[str, Path]
+
+
+class AiClientError(Exception):
+    """шибка при обращении к AI API."""
+
+
+@dataclass(frozen=True)
+class ChatResponse:
+    """твет LLM: текст и/или tool_calls."""
+
+    content: str
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+
+    @property
+    def has_tool_calls(self) -> bool:
+        return bool(self.tool_calls)
+
+
+class AiClient:
+    """лиент ASR/LLM/TTS через OpenAI-совместимое API."""
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        asr_model: str = "whisper-large-v3",
+        llm_model: str = "deepseek-v4-flash",
+        tts_model: str = "gemini-3.8-flash-lite-tts",
+        tts_voice: str = "Zephyr",
+        timeout: float = 30.0,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.asr_model = asr_model
+        self.llm_model = llm_model
+        self.tts_model = tts_model
+        self.tts_voice = tts_voice
+        self.timeout = timeout
+
+    # ------------------------------------------------------------------
+    # изкоуровневый HTTP (JSON)
+    # ------------------------------------------------------------------
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        payload: Optional[Dict[str, Any]] = None,
+        data: Optional[bytes] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        url = f"{self.base_url}{endpoint}"
+        req_headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json",
+        }
+        if headers:
+            req_headers.update(headers)
+
+        body: Optional[bytes] = data
+        if payload is not None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req_headers.setdefault("Content-Type", "application/json")
+
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers=req_headers,
+            method=method,
+        )
+      

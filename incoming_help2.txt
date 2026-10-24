@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "E:\programs\sip_test_client\main.py", line 312, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "E:\programs\sip_test_client\main.py", line 298, in main
+    args = build_parser().parse_args(argv)
+           ^^^^^^^^^^^^^^
+  File "E:\programs\sip_test_client\main.py", line 275, in build_parser
+    incoming = sub.add_parser("incoming", help="многоканальный приём входящих звонков")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\user\AppData\Local\Programs\Python\Python312\Lib\argparse.py", line 1223, in add_parser
+    raise ArgumentError(self, _('conflicting subparser: %s') % name)
+argparse.ArgumentError: argument command: conflicting subparser: incoming

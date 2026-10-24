@@ -1,0 +1,80 @@
+﻿  logger.debug("AI API %s %s", method, endpoint)
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")[:500]
+            raise AiClientError(
+                f"HTTP {exc.code} {exc.reason}: {error_body}"
+            ) from exc
+        except Exception as exc:
+            raise AiClientError(f"шибка запроса к {url}: {exc}") from exc
+
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise AiClientError(f"екорректный JSON от {endpoint}: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # ASR
+    # ------------------------------------------------------------------
+    def transcribe(self, wav_bytes: bytes, prompt: Optional[str] = None) -> str:
+        """аспознать речь из WAV PCM 16-bit mono.
+
+        тправляет multipart/form-data на /audio/transcriptions.
+        """
+        boundary = "----sipbot_asr_boundary"
+        fields = [
+            ("model", self.asr_model),
+            ("language", "ru"),
+        ]
+        if prompt:
+            fields.append(("prompt", prompt))
+
+        body = self._build_multipart(
+            fields=fields,
+            file_name="utterance.wav",
+            file_content_type="audio/wav",
+            file_data=wav_bytes,
+            boundary=boundary,
+        )
+
+        result = self._request(
+            "POST",
+            "/audio/transcriptions",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        text = result.get("text", "")
+        logger.debug("ASR: %r", text)
+        return text
+
+    # ------------------------------------------------------------------
+    # LLM
+    # ------------------------------------------------------------------
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> ChatResponse:
+        """тправить диалог в LLM. озвращает текст и/или tool_calls."""
+        payload: Dict[str, Any] = {
+            "model": self.llm_model,
+            "messages": messages,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        result = self._request("POST", "/chat/completions", payload=payload)
+        choice = result.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        content = message.get("content") or ""
+        tool_calls = message.get("tool_calls")
+        logger.debug("LLM: content=%r tool_calls=%s", content, bool(tool_calls))
+        return ChatResponse(content=content, tool_calls=tool_calls)
+
+    # ------------------------------------------------------------------
+    # TTS
+    # ------------------------------------------------------------------
+    def synthesize(
