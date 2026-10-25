@@ -57,6 +57,20 @@ def test_default_bundle_contains_all_project_prompts():
     assert bundle.size > sum(len(item.content) for item in bundle.documents)
 
 
+def test_internet_private_prompt_documents_seasonal_tariff():
+    text = (REPO_ROOT / "prompts" / "internet_private.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Специальный тариф «Сезонный»" in text
+    for price in ("1000 ₽/мес", "1500 ₽/мес", "2500 ₽/мес"):
+        assert price in text
+    assert "временно не пользуются услугой" in text
+    assert "после предоплаты за год обслуживания" in text
+    assert "предотвратит расторжение договора" in text
+    assert "Сколько стоит „Сезонный“?" in text
+
+
 def test_load_many_reports_missing_file(tmp_path: Path):
     store = PromptStore(tmp_path / "prompts")
     _write(store.root, "exists.md", "ok")
