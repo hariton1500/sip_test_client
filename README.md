@@ -12,9 +12,17 @@
 | `register` | только регистрация (проверка логина/пароля/сети) |
 | `listen` | принимать входящие, отвечать, писать в WAV, запускать бота |
 | `dial` | исходящий звонок, проигрывание WAV, запись ответа |
+| `incoming` | многоканальный приём входящих, запись каждого звонка, опционально UI+ASR |
 
 Боты (`--bot`): `silence`, `echo`, `tone`, `tone:<Гц>:<мс>`,
-`wav:<путь>[:loop]`. Бот получает входящий кадр и возвращает кадр для отправки.
+`wav:<путь>[:loop]`, `placeholder`, `placeholder:<мс>`. Бот получает входящий
+кадр и возвращает кадр для отправки. Полные таблицы ключей — в разделе
+«Запуск и ключи».
+
+Отдельные точки входа: `scripts/prompt_editor.py` (редактор промптов),
+`scripts/live_incoming.py` (локальный harness входящего звонка),
+`scripts/offline_smoke.py` (оффлайн-проверка) и `scripts/sip_trace.py`
+(трассировка SIP/RTP).
 
 ## Веб-интерфейс с живой расшифровкой
 
@@ -78,11 +86,13 @@ python scripts/prompt_editor.py
 
 | Флаг | Назначение |
 |---|---|
-| `--dir prompts` | каталог с промптами (по умолчанию `prompts/` в корне проекта) |
-| `--port 8770` | порт веб-интерфейса (по умолчанию `8766`) |
-| `--host 127.0.0.1` | адрес прослушивания |
+| `--dir DIR` | каталог с промптами (по умолчанию `prompts/` в корне проекта) |
+| `--host HOST` | адрес прослушивания (по умолчанию `127.0.0.1`) |
+| `--port PORT` | порт веб-интерфейса (по умолчанию `8766`; `0` — свободный) |
 | `--no-browser` | не открывать браузер автоматически |
 | `--verbose` | печатать запросы сервера |
+
+Полный справочник по этому и остальным скриптам — в разделе «Запуск и ключи».
 
 По умолчанию сервер доступен только с этой машины и не имеет авторизации.
 Не открывайте его в интернет. Для правки промптов достаточно прав на запись
@@ -164,7 +174,13 @@ Copy-Item .env.example .env
 
 ## Настройка `.env`
 
+`main.py` читает `.env` (путь можно изменить ключом `--env FILE`);
+`scripts/live_incoming.py` и `scripts/sip_trace.py` также используют `.env`.
+Уже экспортированные переменные оболочки имеют приоритет над файлом. Если
+`python-dotenv` не установлен, используется встроенный минимальный парсер.
+
 ```ini
+# --- SIP/АТС ---
 SIP_SERVER=192.168.1.10     # адрес АТС/Asterisk/FreeSWITCH
 SIP_PORT=5060               # порт АТС (UDP)
 SIP_USER=1000               # логин/внутренний номер
@@ -173,53 +189,320 @@ SIP_MY_IP=192.168.1.50      # ОБЯЗАТЕЛЬНО: локальный IPv4 э
 SIP_LOCAL_PORT=5060         # локальный порт SIP (UDP)
 RTP_PORT_LOW=10000
 RTP_PORT_HIGH=10100
+MAX_INCOMING_LINES=16       # значение по умолчанию для incoming --max-lines
+
+# --- ASR/LLM/TTS (OpenAI-совместимый API) ---
+OPENAI_BASE_URL=https://api.aitunnel.ru/v1
+OPENAI_API_KEY=
+ASR_MODEL=whisper-large-v3
+ASR_LANGUAGE=ru
+AI_TIMEOUT=30
 ```
+
+Дополнительные переменные AI-клиента (все необязательны):
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `AI_BASE_URL` | — | синоним `OPENAI_BASE_URL` |
+| `AI_API_KEY` | — | синоним `OPENAI_API_KEY` |
+| `OPENAI_ASR_MODEL` | `whisper-large-v3` | синоним `ASR_MODEL` |
+| `LLM_MODEL` / `OPENAI_LLM_MODEL` | `deepseek-v4-flash` | модель LLM |
+| `TTS_MODEL` / `OPENAI_TTS_MODEL` | `gemini-3.8-flash-lite-tts` | модель TTS |
+| `TTS_VOICE` / `OPENAI_TTS_VOICE` | `Zephyr` | голос TTS |
+| `OPENAI_ASR_LANGUAGE` | `ru` | синоним `ASR_LANGUAGE` |
+| `SSL_CERT_FILE` | системный | путь к CA-файлу для HTTPS к AI-API |
+
+Если `OPENAI_BASE_URL`/`OPENAI_API_KEY` (или их `AI_*` синонимы) не заданы,
+ASR/LLM/TTS отключаются; `incoming --ui` работает, но без расшифровки.
 
 `SIP_MY_IP` проверяется при старте: `0.0.0.0`, `127.0.0.1` и не-IP значения
 отклоняются. Причина — pyVoIP подставляет `myIP` в SDP (`c=IN IP4 ...`);
 с `0.0.0.0` АТС не знает, куда слать RTP, и получается one-way audio.
+`MAX_INCOMING_LINES` не должен превышать число портов в
+`RTP_PORT_LOW..RTP_PORT_HIGH`.
 
 Брандмауэр Windows: разрешите входящий UDP на `SIP_LOCAL_PORT` и на диапазон
 `RTP_PORT_LOW..RTP_PORT_HIGH` для `python.exe`.
 
-## Запуск
+## Запуск и ключи
+
+Все команды выполняются из корня проекта. Основной CLI — `main.py`; отдельные
+инструменты в `scripts/` запускаются самостоятельно и SIP-клиент не подменяют.
+
+| Точка входа | Назначение |
+|---|---|
+| `python main.py ...` | регистрация, входящие/исходящие звонки, многоканальный приём |
+| `python scripts/prompt_editor.py` | локальный веб-редактор промптов |
+| `python scripts/live_incoming.py` | локальный harness: ненастоящая АТС + один входящий звонок |
+| `python scripts/offline_smoke.py` | оффлайн-проверка моста и записи без сети |
+| `python scripts/sip_trace.py` | трассировка SIP/RTP для диагностики |
+
+### `main.py`: общие ключи
 
 ```powershell
-# 1. Только регистрация (быстрая проверка учётки и сети)
-python main.py register --hold 5
-
-# 2. Приём звонка: эхо + запись
-python main.py listen --bot echo --record incoming.wav --duration 60
-
-# 3. Приём звонка с проигрыванием приветствия (в цикле)
-python main.py listen --bot wav:greeting.wav:loop --record incoming.wav
-
-# 4. Исходящий звонок: проиграть файл, записать ответ, 20 секунд
-python main.py dial 1001 --play greeting.wav --record answer.wav --duration 20
-
-# 5. Исходящий звонок: эхо (проверка двустороннего аудио)
-python main.py dial 1001 --bot echo --duration 15
-
-# 6. Проверка исходящего звука тоном 1 кГц
-python main.py dial 1001 --bot tone --duration 10
+python main.py [--env FILE] [-v|--verbose] <команда> [ключи]
 ```
 
-`--timeout` в `dial` — ожидание ответа, в `listen` — общее время ожидания
-звонков (0 = бесконечно). `--duration 0` — говорить до отбоя.
+| Ключ | По умолчанию | Назначение |
+|---|---|---|
+| `--env FILE` | `.env` | путь к файлу с настройками |
+| `-v`, `--verbose` | выкл. | отладочные логи (DEBUG) |
 
-Логи идут в stderr, запись — в указанный WAV (моно, 16 бит, 8 кГц; при
-необходимости пересемплируйте: `ffmpeg -i in.wav -ar 16000 out.wav`).
+Общие ключи указываются **до** команды, например:
+`python main.py --env .env.test -v register`.
+
+У каждой подкоманды `main.py` и у каждого скрипта есть `-h`/`--help` с
+актуальным списком ключей: `python main.py incoming --help`,
+`python scripts/prompt_editor.py --help` и т. п.
+
+Если одноимённая переменная уже экспортирована в оболочке, она имеет приоритет
+над `.env` (`load_dotenv` не перезаписывает окружение). Проверить мешающую
+переменную можно через `printenv SIP_MY_IP`, убрать — `unset SIP_MY_IP`.
+
+### `register` — только регистрация
+
+```powershell
+python main.py register [--timeout SEC] [--hold SEC]
+```
+
+| Ключ | По умолчанию | Назначение |
+|---|---|---|
+| `--timeout SEC` | `20` | сколько ждать статуса `REGISTERED` |
+| `--hold SEC` | `0` | сколько держать регистрацию после успеха |
+
+```powershell
+python main.py register
+python main.py register --hold 5
+python main.py register --timeout 30 --hold 10
+```
+
+### `listen` — одноканальный приём входящих
+
+```powershell
+python main.py listen [--bot SPEC] [--record FILE] [--timeout SEC] [--duration SEC]
+```
+
+| Ключ | По умолчанию | Назначение |
+|---|---|---|
+| `--bot SPEC` | `silence` | что отвечать абоненту (см. «Боты») |
+| `--record FILE` | нет | писать звук абонента в WAV |
+| `--timeout SEC` | `0` | общее время ожидания звонков; `0` — бесконечно |
+| `--duration SEC` | `0` | максимальная длительность звонка; `0` — до отбоя |
+
+`listen` обрабатывает звонки последовательно и после каждого снова ждёт
+следующий. Остановка — `Ctrl+C`, либо по `--timeout`.
+
+```powershell
+# эхо + запись, максимум 60 секунд на звонок
+python main.py listen --bot echo --record incoming.wav --duration 60
+
+# приветствие в цикле, ждать звонка не дольше 10 минут
+python main.py listen --bot wav:greeting.wav:loop --record incoming.wav --timeout 600
+
+# молчать и ждать до отбоя
+python main.py listen --bot silence --timeout 0 --duration 0
+```
+
+### `dial` — исходящий звонок
+
+```powershell
+python main.py dial TARGET [--play FILE] [--bot SPEC] [--record FILE] [--duration SEC] [--timeout SEC]
+```
+
+| Аргумент/ключ | По умолчанию | Назначение |
+|---|---|---|
+| `TARGET` | обязателен | номер/логин; `sip:1001@host` тоже принимается, хост игнорируется |
+| `--play FILE` | нет | проиграть WAV абоненту после ответа |
+| `--bot SPEC` | нет | бот для входящего звука, если не задан `--play` |
+| `--record FILE` | нет | писать ответ абонента в WAV |
+| `--duration SEC` | `20` | длительность разговора после ответа; `0` — до отбоя |
+| `--timeout SEC` | `20` | ожидание ответа на INVITE |
+
+`--play` имеет приоритет над `--bot`: при одновременном указании будет
+проигрываться WAV. Если не задано ни то, ни другое, клиент только слушает.
+
+```powershell
+python main.py dial 1001 --play greeting.wav --record answer.wav --duration 20
+python main.py dial 1001 --bot echo --duration 15
+python main.py dial 1001 --bot tone --duration 10
+python main.py dial 1001 --bot tone:800:500 --record answer.wav --duration 0
+```
+
+### `incoming` — многоканальный приём входящих
+
+```powershell
+python main.py incoming [--bot SPEC] [--record-dir DIR] [--max-lines N] [--ui]
+                        [--ui-host HOST] [--ui-port PORT] [--no-asr]
+```
+
+| Ключ | По умолчанию | Назначение |
+|---|---|---|
+| `--bot SPEC` | `placeholder` | обработчик каждого звонка (см. «Боты») |
+| `--record-dir DIR` | `recordings` | каталог для WAV каждого входящего звонка |
+| `--max-lines N` | `MAX_INCOMING_LINES` (`16`) | сколько звонков обслуживать одновременно |
+| `--ui` | выкл. | включить веб-интерфейс и живую расшифровку (ASR) |
+| `--ui-host HOST` | `127.0.0.1` | адрес веб-интерфейса |
+| `--ui-port PORT` | `8765` | порт веб-интерфейса |
+| `--no-asr` | выкл. | не распознавать речь; UI покажет только события звонка |
+
+`incoming` работает до `Ctrl+C` и не завершается после первого звонка. Каждый
+звонок пишется отдельным WAV в `--record-dir`. `--max-lines` не должен
+превышать число портов в `RTP_PORT_LOW..RTP_PORT_HIGH`. Для `--ui` нужны
+`OPENAI_BASE_URL` и `OPENAI_API_KEY`; без них используйте `--no-asr` либо
+запускайте без `--ui`.
+
+```powershell
+# минимальный многоканальный приём без веба
+python main.py incoming --bot placeholder --record-dir recordings --max-lines 4
+
+# веб-интерфейс + ASR + эхо; удобно для проверки входящего звонка
+python main.py incoming --ui --bot echo --max-lines 1
+
+# только события звонка в UI, без обращения к ASR
+python main.py incoming --ui --no-asr --ui-port 9000
+
+# приветствие в цикле всем звонящим
+python main.py incoming --bot wav:greeting.wav:loop --record-dir recordings
+```
+
+После запуска с `--ui` откройте `http://127.0.0.1:8765/` (или свой `--ui-port`).
+С `--ui-host 0.0.0.0` интерфейс доступен из сети, но авторизации нет.
+
+### Боты (`--bot`)
+
+| Спецификация | Поведение |
+|---|---|
+| `silence` | ничего не отправляет (в `listen` это значение по умолчанию) |
+| `echo` | возвращает входящий звук обратно |
+| `tone` | тон 1000 Гц по 300 мс с паузой 2700 мс |
+| `tone:<Гц>:<мс>` | тон заданной частоты и длительности, пауза 2700 мс |
+| `wav:<путь>` | проигрывает WAV один раз, затем молчит |
+| `wav:<путь>:loop` | проигрывает WAV по кругу |
+| `placeholder` | короткое приветствие 500 мс (800 Гц), затем молчит |
+| `placeholder:<мс>` | приветствие заданной длительности, затем молчит |
+
+WAV ресемплируется в 8 кГц. В `dial` ключ `--play FILE` — это сокращение для
+`--bot wav:FILE` без цикла. Неизвестная спецификация завершает запуск ошибкой
+конфигурации.
+
+### `scripts/prompt_editor.py` — отдельный редактор промптов
+
+```powershell
+python scripts/prompt_editor.py [--dir DIR] [--host HOST] [--port PORT]
+                                [--no-browser] [--verbose]
+```
+
+| Ключ | По умолчанию | Назначение |
+|---|---|---|
+| `--dir DIR` | `<корень проекта>/prompts` | каталог, который показывать и редактировать |
+| `--host HOST` | `127.0.0.1` | адрес прослушивания |
+| `--port PORT` | `8766` | порт HTTP; `0` — выбрать свободный |
+| `--no-browser` | выкл. | не открывать браузер автоматически |
+| `--verbose` | выкл. | подробный лог HTTP-запросов |
+
+Редактор не запускает SIP-клиент и не требует `.env`. Остановка — `Ctrl+C`.
+Каталог `--dir` создаётся при запуске, если его нет; если путь указывает на
+файл или каталог недоступен для записи, будет ошибка.
+
+```powershell
+# обычный запуск: откроется браузер на http://127.0.0.1:8766/
+python scripts/prompt_editor.py
+
+# другой каталог и порт, без автозапуска браузера
+python scripts/prompt_editor.py --dir prompts --port 9000 --no-browser
+
+# доступ из локальной сети (без авторизации!)
+python scripts/prompt_editor.py --host 0.0.0.0 --port 9000
+
+# свободный порт: адрес будет напечатан в консоли
+python scripts/prompt_editor.py --port 0 --no-browser
+```
+
+### `scripts/live_incoming.py` — локальный harness одного входящего
+
+Скрипт поднимает минимальную SIP-АТС и вызывающего на локальном IPv4,
+запускает `main.py incoming`, делает один звонок, обменивается RTP, кладёт
+трубку и сохраняет отчёт. Настоящая АТС и проброс портов не нужны.
+
+```powershell
+python scripts/live_incoming.py [ключи]
+```
+
+| Ключ | По умолчанию | Назначение |
+|---|---|---|
+| `--my-ip IP` | автоопределение | IPv4 интерфейса для SIP/RTP |
+| `--sip-port PORT` | `15060` | порт harness-АТС |
+| `--client-sip-port PORT` | `15061` | локальный SIP-порт клиента |
+| `--client-user USER` | `SIP_USER` или `503` | SIP-логин тестируемого клиента |
+| `--caller-user USER` | `508` | номер вызывающего абонента |
+| `--rtp-low PORT` | `12100` | нижняя граница RTP-портов клиента |
+| `--rtp-high PORT` | `12120` | верхняя граница RTP-портов клиента |
+| `--bot SPEC` | `tone` | бот клиента (`tone`, `placeholder`, `echo`, `silence`, `wav:...`) |
+| `--caller-wav FILE` | нет | WAV, который вызывающий отправляет клиенту (проверка ASR) |
+| `--ui` | выкл. | включить веб-интерфейс клиента |
+| `--ui-port PORT` | `8765` | порт веб-интерфейса клиента |
+| `--no-asr` | выкл. | не включать ASR в клиенте |
+| `--ui-hold SEC` | `0` | держать клиент и UI после звонка |
+| `--duration SEC` | `8` | длительность разговора после ответа |
+| `--record-dir DIR` | `recordings/live_incoming_one` | каталог результатов |
+| `--keep` | выкл. | не очищать каталог результатов перед запуском |
+| `--reg-timeout SEC` | `25` | ожидание регистрации клиента |
+
+Результаты: `client.log`, `caller_heard.wav`, запись клиента и `report.txt` с
+итогом `PASS/FAIL`.
+
+```powershell
+# базовый прогон без веба
+python scripts/live_incoming.py
+
+# проверить живую расшифровку на заранее записанной речи
+python scripts/live_incoming.py --bot tone --ui --caller-wav echo_test.wav --ui-hold 120
+
+# другой бот и каталог, сохранить предыдущие результаты
+python scripts/live_incoming.py --bot echo --duration 15 --record-dir recordings/echo --keep
+```
+
+### `scripts/offline_smoke.py` — оффлайн-проверка
+
+```powershell
+python scripts/offline_smoke.py
+```
+
+Ключей нет. Проверяет `SipPhone` + `MediaBridge` + `Recorder` + `WavFileBot`
+без сети, создаёт файлы в `.pytest_tmp/` и печатает статистику обмена.
+
+### `scripts/sip_trace.py` — трассировка SIP/RTP
+
+```powershell
+python scripts/sip_trace.py [СЕКУНДЫ] [--rtp] [--stack] [--debug]
+```
+
+| Аргумент/ключ | По умолчанию | Назначение |
+|---|---|---|
+| `СЕКУНДЫ` | `10` | сколько секунд держать регистрацию и слушать сокеты |
+| `--rtp` | выкл. | печатать каждый RTP-пакет (иначе только считать) |
+| `--stack` | выкл. | печатать стек вызовов для исходящих SIP-сообщений |
+| `--debug` | выкл. | включить хуки `register()` и таймера перерегистрации |
+
+Скрипт читает `.env`, печатает каждое SIP-сообщение и итоговые счётчики
+пакетов. Полезен, когда АТС не отвечает на REGISTER или «пропадает» звук.
+
+```powershell
+python scripts/sip_trace.py 15
+python scripts/sip_trace.py 15 --rtp
+python scripts/sip_trace.py 30 --debug --stack
+```
 
 ## Структура проекта
 
 ```
-main.py                 CLI: register / listen / dial
+main.py                 CLI: register / listen / dial / incoming
 sipbot/config.py        Settings, чтение .env, валидация (SIP_MY_IP, порты)
 sipbot/phone.py         SipPhone: VoIPPhone, регистрация, очередь входящих,
                         нормализация номера (pyVoIP ждёт номер, не URI)
 sipbot/media.py         MediaBridge (2 потока: чтение/запись, такт 20 мс)
                         Recorder (потоковая запись в WAV)
-sipbot/bots.py          SilenceBot / EchoBot / ToneBot / WavFileBot + build_bot
+sipbot/bots.py          SilenceBot / EchoBot / ToneBot / PlaceholderBot / WavFileBot + build_bot
 sipbot/vad.py           EnergyVAD: сегментация речи для ASR
 sipbot/transcript.py    TranscriptStore: история реплик + подписки для UI
 sipbot/transcribing_bot.py  обёртка бота: VAD -> ASR -> лента разговора
