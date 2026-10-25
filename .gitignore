@@ -6,3 +6,7 @@ __pycache__/
 .env
 *.wav
 pytest_out.txt
+.DS_Store
+.vscode/
+cache/
+recordings/

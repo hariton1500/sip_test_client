@@ -17,11 +17,15 @@ import sys
 import time
 from typing import Optional
 
+from sipbot.ai_client import AiClient
 from sipbot.bots import build_bot
 from sipbot.config import Settings
 from sipbot.incoming import IncomingDispatcher
 from sipbot.media import MediaBridge, Recorder
 from sipbot.phone import SipPhone
+from sipbot.transcript import SYSTEM, TranscriptStore
+from sipbot.transcribing_bot import TranscribingBot
+from sipbot.ui_server import start_ui_server
 
 logger = logging.getLogger("sipbot")
 
@@ -135,28 +139,59 @@ def cmd_incoming(settings: Settings, args: argparse.Namespace) -> int:
         )
         settings.validate()
 
+    store = None
+    ai = None
+    ui_server = None
+    if args.ui:
+        store = TranscriptStore()
+        ai = None if args.no_asr else AiClient.from_env()
+        if ai is None:
+            reason = (
+                "ASR отключён ключом --no-asr"
+                if args.no_asr
+                else "ASR не настроен: задайте OPENAI_BASE_URL и OPENAI_API_KEY в .env"
+            )
+            logger.warning(reason)
+            store.publish(SYSTEM, reason)
+        else:
+            logger.info("ASR: модель=%s язык=%s", ai.asr_model, ai.asr_language)
+        try:
+            ui_server = start_ui_server(store, args.ui_host, args.ui_port)
+        except OSError as exc:
+            logger.error(
+                "Не удалось запустить веб-интерфейс на %s:%d: %s",
+                args.ui_host,
+                args.ui_port,
+                exc,
+            )
+            return 2
+
+    def make_bot():
+        bot = build_bot(args.bot)
+        if store is not None:
+            return TranscribingBot(bot, store, ai)
+        return bot
+
     phone = SipPhone(settings)
     dispatcher = IncomingDispatcher(
         phone=phone,
         settings=settings,
-        bot_factory=lambda: build_bot(args.bot),
+        bot_factory=make_bot,
         record_dir=args.record_dir,
     )
-    phone.start(on_incoming=dispatcher.handle_incoming)
-    status = phone.wait_registered(20.0)
-    logger.info("Статус регистрации: %s", status.name)
-    if status.name != "REGISTERED":
-        phone.stop()
-        dispatcher.shutdown()
-        raise SystemExit("Регистрация не удалась")
-
-    logger.info(
-        "Многоканальный приём входящих: bot=%s max_lines=%d record_dir=%s",
-        args.bot,
-        settings.max_incoming_lines,
-        args.record_dir,
-    )
     try:
+        phone.start(on_incoming=dispatcher.handle_incoming)
+        status = phone.wait_registered(20.0)
+        logger.info("Статус регистрации: %s", status.name)
+        if status.name != "REGISTERED":
+            raise SystemExit("Регистрация не удалась")
+
+        logger.info(
+            "Многоканальный приём входящих: bot=%s max_lines=%d record_dir=%s",
+            args.bot,
+            settings.max_incoming_lines,
+            args.record_dir,
+        )
         while True:
             time.sleep(1)
             logger.debug(
@@ -169,6 +204,8 @@ def cmd_incoming(settings: Settings, args: argparse.Namespace) -> int:
     finally:
         dispatcher.shutdown()
         phone.stop()
+        if ui_server is not None:
+            ui_server.stop()
     return 0
 
 
@@ -269,6 +306,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="переопределить MAX_INCOMING_LINES",
+    )
+    incoming.add_argument(
+        "--ui",
+        action="store_true",
+        help="запустить веб-интерфейс с живой расшифровкой разговора",
+    )
+    incoming.add_argument(
+        "--ui-host",
+        default="127.0.0.1",
+        help="адрес веб-интерфейса (по умолчанию 127.0.0.1)",
+    )
+    incoming.add_argument(
+        "--ui-port",
+        type=int,
+        default=8765,
+        help="порт веб-интерфейса (по умолчанию 8765)",
+    )
+    incoming.add_argument(
+        "--no-asr",
+        action="store_true",
+        help="не распознавать речь (UI покажет только события звонка)",
     )
     incoming.set_defaults(func=cmd_incoming)
 

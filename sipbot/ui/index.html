@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Разговор в реальном времени — SIP test client</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #070b16;
+      --panel: rgba(17, 25, 44, .82);
+      --panel-strong: rgba(21, 31, 54, .96);
+      --line: rgba(148, 163, 184, .16);
+      --text: #e8eefc;
+      --muted: #8ea0c4;
+      --accent: #6d8cff;
+      --accent-2: #8f6dff;
+      --ok: #42d392;
+      --warn: #ffbd5c;
+      --danger: #ff6b81;
+      --radius: 20px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        "Helvetica Neue", Arial, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(900px 600px at 8% -10%, rgba(109, 140, 255, .22), transparent 60%),
+        radial-gradient(800px 500px at 100% 0%, rgba(143, 109, 255, .17), transparent 55%),
+        linear-gradient(160deg, #070b16 0%, #0a1020 55%, #070b16 100%);
+      min-height: 100vh;
+      padding: 24px;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image: linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
+      background-size: 48px 48px;
+      mask-image: radial-gradient(circle at 50% 20%, black, transparent 75%);
+    }
+    .app {
+      position: relative;
+      z-index: 1;
+      width: min(1180px, 100%);
+      margin: 0 auto;
+      display: grid;
+      gap: 18px;
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 18px 22px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(135deg, rgba(23, 34, 61, .9), rgba(12, 18, 34, .84));
+      box-shadow: 0 24px 60px rgba(0, 0, 0, .35), inset 0 1px rgba(255,255,255,.05);
+      backdrop-filter: blur(16px);
+    }
+    .brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
+    .logo {
+      width: 46px; height: 46px; flex: 0 0 auto;
+      display: grid; place-items: center;
+      border-radius: 15px;
+      background: linear-gradient(145deg, var(--accent), var(--accent-2));
+      box-shadow: 0 10px 28px rgba(109, 140, 255, .35);
+      font-size: 22px;
+    }
+    .topbar h1 {
+      margin: 0;
+      font-size: clamp(17px, 2.1vw, 22px);
+      letter-spacing: -.02em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .topbar p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+    .actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .status {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 9px 13px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(7, 11, 22, .55);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .status .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--warn);
+      box-shadow: 0 0 0 4px rgba(255, 189, 92, .12);
+    }
+    .status[data-state="live"] { color: #c7ffe6; border-color: rgba(66, 211, 146, .3); }
+    .status[data-state="live"] .dot {
+      background: var(--ok); box-shadow: 0 0 0 4px rgba(66, 211, 146, .13);
+      animation: pulse 1.8s infinite;
+    }
+    .status[data-state="offline"] { color: #ffd3da; border-color: rgba(255, 107, 129, .3); }
+    .status[data-state="offline"] .dot { background: var(--danger); box-shadow: 0 0 0 4px rgba(255,107,129,.12); }
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 4px rgba(66, 211, 146, .13); }
+      50% { box-shadow: 0 0 0 8px rgba(66, 211, 146, .02); }
+    }
+    button {
+      font: inherit;
+      color: var(--text);
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, .05);
+      border-radius: 12px;
+      padding: 10px 15px;
+      cursor: pointer;
+      transition: .18s ease;
+    }
+    button:hover { background: rgba(255,255,255,.1); border-color: rgba(148,163,184,.32); }
+    button:active { transform: translateY(1px); }
+    .stage {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 300px;
+      gap: 18px;
+      align-items: start;
+    }
+    .chat-panel {
+      display: flex;
+      flex-direction: column;
+      min-height: min(72vh, 760px);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: 0 24px 70px rgba(0,0,0,.32), inset 0 1px rgba(255,255,255,.04);
+      backdrop-filter: blur(18px);
+      overflow: hidden;
+    }
+    .chat-head {
+      display: flex; align-items: center; justify-content: space-between; gap: 14px;
+      padding: 18px 22px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(255,255,255,.035), transparent);
+    }
+    .eyebrow {
+      display: block;
+      color: var(--accent);
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      margin-bottom: 4px;
+    }
+    .chat-head h2 { margin: 0; font-size: 18px; letter-spacing: -.01em; }
+    .legend { display: flex; gap: 14px; color: var(--muted); font-size: 11px; }
+    .legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .legend i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+    .legend .caller { background: #c9d5ee; }
+    .legend .bot { background: var(--accent); }
+
+    .messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px 22px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      scroll-behavior: smooth;
+      min-height: 320px;
+      max-height: calc(72vh - 150px);
+    }
+    .messages::-webkit-scrollbar { width: 10px; }
+    .messages::-webkit-scrollbar-thumb {
+      background: rgba(148,163,184,.2);
+      border-radius: 99px;
+      border: 3px solid transparent;
+      background-clip: content-box;
+    }
+    .empty {
+      margin: auto;
+      text-align: center;
+      color: var(--muted);
+      max-width: 340px;
+      padding: 36px 18px;
+    }
+    .empty .icon {
+      width: 58px; height: 58px;
+      margin: 0 auto 16px;
+      display: grid; place-items: center;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: rgba(109,140,255,.1);
+      font-size: 26px;
+      animation: breathe 2.8s ease-in-out infinite;
+    }
+    @keyframes breathe {
+      0%, 100% { transform: translateY(0); opacity: .8; }
+      50% { transform: translateY(-5px); opacity: 1; }
+    }
+    .empty strong { display: block; color: #c9d5ee; margin-bottom: 7px; font-size: 15px; }
+    .empty p { margin: 0; font-size: 13px; line-height: 1.55; }
+    .msg {
+      display: flex;
+      align-items: flex-end;
+      gap: 10px;
+      max-width: 82%;
+      animation: appear .26s ease both;
+    }
+    @keyframes appear {
+      from { opacity: 0; transform: translateY(8px) scale(.985); }
+      to { opacity: 1; transform: none; }
+    }
+    .msg--caller { align-self: flex-start; }
+    .msg--bot { align-self: flex-end; flex-direction: row-reverse; }
+    .avatar {
+      width: 30px; height: 30px; flex: 0 0 auto;
+      display: grid; place-items: center;
+      border-radius: 10px;
+      font-size: 13px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.05);
+    }
+    .msg--caller .avatar { background: rgba(201,213,238,.1); }
+    .msg--bot .avatar { background: linear-gradient(145deg, var(--accent), var(--accent-2)); border: 0; }
+    .bubble-wrap { min-width: 0; }
+    .meta {
+      display: flex; align-items: center; gap: 8px;
+      margin: 0 4px 5px;
+      color: var(--muted);
+      font-size: 10.5px;
+      font-weight: 600;
+      letter-spacing: .02em;
+    }
+    .msg--bot .meta { justify-content: flex-end; }
+    .bubble {
+      padding: 12px 15px;
+      border-radius: 16px;
+      border: 1px solid rgba(148,163,184,.14);
+      background: rgba(255,255,255,.055);
+      color: #eef3ff;
+      font-size: 14.5px;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+      box-shadow: 0 8px 24px rgba(0,0,0,.12);
+    }
+    .msg--caller .bubble { border-bottom-left-radius: 5px; }
+    .msg--bot .bubble {
+      border: 0;
+      border-bottom-right-radius: 5px;
+      background: linear-gradient(145deg, #5d7cff, #7a5cff);
+      box-shadow: 0 10px 30px rgba(109,140,255,.25);
+    }
+    .event {
+      align-self: center;
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      max-width: 92%;
+      padding: 7px 12px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(7,11,22,.55);
+      color: var(--muted);
+      font-size: 11.5px;
+      text-align: center;
+      animation: appear .22s ease both;
+    }
+    .event::before {
+      content: "";
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--accent);
+      flex: 0 0 auto;
+    }
+    .event time { opacity: .65; }
+    .chat-foot {
+      display: flex; justify-content: space-between; align-items: center; gap: 12px;
+      padding: 12px 20px;
+      border-top: 1px solid var(--line);
+      background: rgba(7,11,22,.35);
+      color: var(--muted);
+      font-size: 11.5px;
+    }
+    .chat-foot button { padding: 7px 11px; border-radius: 9px; font-size: 11.5px; }
+    .side { display: grid; gap: 14px; }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 17px;
+      background: var(--panel-strong);
+      padding: 17px 18px;
+      box-shadow: 0 18px 45px rgba(0,0,0,.25), inset 0 1px rgba(255,255,255,.04);
+    }
+    .card h3 {
+      margin: 0 0 13px;
+      color: #c9d5ee;
+      font-size: 11px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .state-row {
+      display: flex; justify-content: space-between; gap: 12px;
+      padding: 9px 0;
+      border-bottom: 1px solid rgba(148,163,184,.09);
+      font-size: 12.5px;
+    }
+    .state-row:last-child { border-bottom: 0; padding-bottom: 0; }
+    .state-row span:first-child { color: var(--muted); }
+    .state-row span:last-child { text-align: right; font-weight: 600; }
+    .state-row .live { color: var(--ok); }
+    .state-row .idle { color: var(--muted); }
+    .card p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .card code {
+      color: #b8c7ea;
+      background: rgba(255,255,255,.06);
+      border-radius: 5px;
+      padding: 1px 5px;
+      font-size: 11px;
+    }
+    @media (max-width: 900px) {
+      body { padding: 12px; }
+      .stage { grid-template-columns: 1fr; }
+      .side { grid-template-columns: 1fr 1fr; }
+      .chat-panel { min-height: 68vh; }
+      .messages { max-height: none; }
+    }
+    @media (max-width: 620px) {
+      .topbar { align-items: flex-start; flex-direction: column; padding: 15px; }
+      .actions { width: 100%; justify-content: space-between; }
+      .side { grid-template-columns: 1fr; }
+      .legend { display: none; }
+      .msg { max-width: 94%; }
+      .messages { padding: 18px 14px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">◉</div>
+        <div>
+          <h1>Разговор в реальном времени</h1>
+          <p id="subtitle">Текстовая расшифровка входящего звонка</p>
+        </div>
+      </div>
+      <div class="actions">
+        <span class="status" id="connection" data-state="connecting" role="status">
+          <span class="dot" aria-hidden="true"></span>
+          <span id="connectionText">Подключение…</span>
+        </span>
+        <button type="button" id="clearButton" title="Очистить ленту у всех подключённых окон">
+          Очистить
+        </button>
+      </div>
+    </header>
+
+    <main class="stage">
+      <section class="chat-panel" aria-label="Лента разговора">
+        <div class="chat-head">
+          <div>
+            <span class="eyebrow">Live transcript</span>
+            <h2>Диалог</h2>
+          </div>
+          <div class="legend" aria-hidden="true">
+            <span><i class="caller"></i>Абонент</span>
+            <span><i class="bot"></i>Бот</span>
+          </div>
+        </div>
+
+        <div class="messages" id="messages" aria-live="polite" aria-relevant="additions">
+          <div class="empty" id="emptyState">
+            <div class="icon" aria-hidden="true">🎧</div>
+            <strong>Ожидание звонка</strong>
+            <p>Как только абонент позвонит и скажет первую фразу,
+              распознанный текст появится здесь в реальном времени.</p>
+          </div>
+        </div>
+
+        <div class="chat-foot">
+          <span id="footerHint">Реплики добавляются автоматически</span>
+          <button type="button" id="scrollButton" hidden>К последней реплике ↓</button>
+        </div>
+      </section>
+
+      <aside class="side">
+        <section class="card" aria-label="Состояние звонка">
+          <h3>Состояние</h3>
+          <div class="state-row">
+            <span>Линия</span>
+            <span id="callState" class="idle">ожидание</span>
+          </div>
+          <div class="state-row">
+            <span>Call-ID</span>
+            <span id="callId" title="">—</span>
+          </div>
+          <div class="state-row">
+            <span>Реплик</span>
+            <span id="messageCount">0</span>
+          </div>
+          <div class="state-row">
+            <span>Обновлено</span>
+            <span id="updatedAt">—</span>
+          </div>
+        </section>
+
+        <section class="card" aria-label="Как это работает">
+          <h3>Как это работает</h3>
+          <p>Аудио абонента проходит через VAD. Когда реплика заканчивается,
+            WAV уходит в ASR, а распознанный текст появляется в ленте.
+            Звук звонка при этом не прерывается.</p>
+          <p style="margin-top:10px">Запуск: <code>python main.py incoming --ui</code></p>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+<script>
+    (() => {
+      "use strict";
+
+      const messagesEl = document.getElementById("messages");
+      const emptyState = document.getElementById("emptyState");
+      const connectionEl = document.getElementById("connection");
+      const connectionText = document.getElementById("connectionText");
+      const clearButton = document.getElementById("clearButton");
+      const scrollButton = document.getElementById("scrollButton");
+      const callStateEl = document.getElementById("callState");
+      const callIdEl = document.getElementById("callId");
+      const messageCountEl = document.getElementById("messageCount");
+      const updatedAtEl = document.getElementById("updatedAt");
+      const footerHint = document.getElementById("footerHint");
+
+      const state = { seen: new Set(), messages: [], autoScroll: true };
+      const ROLE_LABEL = { caller: "Абонент", bot: "Бот" };
+      const ROLE_ICON = { caller: "👤", bot: "🤖" };
+
+      function formatTime(seconds) {
+        if (!seconds) return "";
+        return new Date(seconds * 1000).toLocaleTimeString("ru-RU", {
+          hour: "2-digit", minute: "2-digit", second: "2-digit",
+        });
+      }
+
+      function isNearBottom() {
+        return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 90;
+      }
+
+      function scrollToBottom(smooth = true) {
+        messagesEl.scrollTo({
+          top: messagesEl.scrollHeight,
+          behavior: smooth ? "smooth" : "auto",
+        });
+      }
+
+      function ensureEmptyState() {
+        if (!state.messages.length && !emptyState.isConnected) {
+          messagesEl.appendChild(emptyState);
+        }
+        if (state.messages.length && emptyState.isConnected) {
+          emptyState.remove();
+        }
+      }
+
+      function updateCounters(message) {
+        messageCountEl.textContent = String(state.messages.length);
+        if (message.created_at) updatedAtEl.textContent = formatTime(message.created_at);
+        if (message.call_id) {
+          callIdEl.textContent = message.call_id;
+          callIdEl.title = message.call_id;
+        }
+        if (message.role === "system") {
+          if (message.text.startsWith("Входящий звонок")) {
+            callStateEl.textContent = "на линии";
+            callStateEl.className = "live";
+            footerHint.textContent = "Идёт приём речи абонента";
+          } else if (message.text.startsWith("Звонок завершён")) {
+            callStateEl.textContent = "завершён";
+            callStateEl.className = "idle";
+            footerHint.textContent = "Ожидание следующего звонка";
+          }
+        }
+      }
+
+      function buildNode(message) {
+        if (message.role === "system") {
+          const event = document.createElement("div");
+          event.className = "event";
+          const text = document.createElement("span");
+          text.textContent = message.text;
+          const time = document.createElement("time");
+          time.textContent = formatTime(message.created_at);
+          event.append(text, time);
+          return event;
+        }
+
+        const role = message.role === "bot" ? "bot" : "caller";
+        const article = document.createElement("article");
+        article.className = "msg msg--" + role;
+
+        const avatar = document.createElement("div");
+        avatar.className = "avatar";
+        avatar.textContent = ROLE_ICON[role];
+        avatar.setAttribute("aria-hidden", "true");
+
+        const wrap = document.createElement("div");
+        wrap.className = "bubble-wrap";
+
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        const name = document.createElement("span");
+        name.textContent = ROLE_LABEL[role];
+        const time = document.createElement("time");
+        time.textContent = formatTime(message.created_at);
+        meta.append(name, time);
+
+        const bubble = document.createElement("div");
+        bubble.className = "bubble";
+        bubble.textContent = message.text;
+
+        wrap.append(meta, bubble);
+        article.append(avatar, wrap);
+        return article;
+      }
+
+      function appendMessage(message) {
+        if (!message || state.seen.has(message.id)) return;
+        state.seen.add(message.id);
+        state.messages.push(message);
+        messagesEl.appendChild(buildNode(message));
+        ensureEmptyState();
+        updateCounters(message);
+        if (state.autoScroll) scrollToBottom();
+      }
+
+      function resetLenta() {
+        state.seen.clear();
+        state.messages = [];
+        messagesEl.querySelectorAll(".msg, .event").forEach((node) => node.remove());
+        ensureEmptyState();
+        messageCountEl.textContent = "0";
+        callStateEl.textContent = "ожидание";
+        callStateEl.className = "idle";
+        callIdEl.textContent = "—";
+        callIdEl.title = "";
+        updatedAtEl.textContent = "—";
+        footerHint.textContent = "Реплики добавляются автоматически";
+      }
+
+      function renderSnapshot(messages) {
+        resetLenta();
+        (messages || []).forEach((message) => {
+          state.seen.add(message.id);
+          state.messages.push(message);
+          messagesEl.appendChild(buildNode(message));
+          updateCounters(message);
+        });
+        ensureEmptyState();
+        messageCountEl.textContent = String(state.messages.length);
+        if (state.messages.length) scrollToBottom(false);
+      }
+
+      function setConnection(mode) {
+        connectionEl.dataset.state = mode;
+        connectionText.textContent = {
+          live: "На связи",
+          connecting: "Подключение…",
+          offline: "Нет связи с сервером",
+        }[mode] || mode;
+      }
+
+      messagesEl.addEventListener("scroll", () => {
+        state.autoScroll = isNearBottom();
+        scrollButton.hidden = state.autoScroll;
+      }, { passive: true });
+
+      scrollButton.addEventListener("click", () => {
+        state.autoScroll = true;
+        scrollButton.hidden = true;
+        scrollToBottom();
+      });
+
+      clearButton.addEventListener("click", async () => {
+        clearButton.disabled = true;
+        try {
+          await fetch("/api/clear", { method: "POST" });
+          resetLenta();
+        } catch (error) {
+          setConnection("offline");
+        } finally {
+          clearButton.disabled = false;
+        }
+      });
+
+      const source = new EventSource("/events");
+      source.addEventListener("open", () => setConnection("live"));
+      source.addEventListener("snapshot", (event) => {
+        setConnection("live");
+        try {
+          renderSnapshot(JSON.parse(event.data).messages);
+        } catch (error) {
+          console.error("Некорректный snapshot", error);
+        }
+      });
+      source.addEventListener("message", (event) => {
+        try {
+          appendMessage(JSON.parse(event.data));
+        } catch (error) {
+          console.error("Некорректное сообщение", error);
+        }
+      });
+      source.addEventListener("clear", () => resetLenta());
+      source.addEventListener("error", () => {
+        // EventSource сам переподключается: CLOSED — сервер недоступен,
+        // CONNECTING — идёт повторная попытка.
+        setConnection(source.readyState === EventSource.CLOSED ? "offline" : "connecting");
+      });
+      window.addEventListener("beforeunload", () => source.close());
+    })();
+  </script>
+
+
+</body>
+</html>

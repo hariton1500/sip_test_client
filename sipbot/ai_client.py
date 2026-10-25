@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import ssl
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,34 @@ class ChatResponse:
         return bool(self.tool_calls)
 
 
+def _default_ssl_context() -> ssl.SSLContext:
+    """SSL-контекст с системными/сертификатными корнями.
+
+    В отдельных сборках Python (например, на macOS) ``ssl`` не находит
+    CA-файл по умолчанию. Тогда подхватываем certifi или стандартные пути,
+    чтобы HTTPS-запросы к AI API не падали с CERTIFICATE_VERIFY_FAILED.
+    """
+    try:
+        import certifi  # type: ignore
+    except ImportError:
+        pass
+    else:
+        return ssl.create_default_context(cafile=certifi.where())
+
+    context = ssl.create_default_context()
+    if context.cert_store_stats().get("x509_ca", 0) == 0:
+        for path in (
+            os.environ.get("SSL_CERT_FILE", ""),
+            "/etc/ssl/cert.pem",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/certs/ca-certificates.crt",
+        ):
+            if path and os.path.isfile(path):
+                context.load_verify_locations(cafile=path)
+                break
+    return context
+
+
 class AiClient:
     """Клиент ASR/LLM/TTS через OpenAI-совместимое API."""
 
@@ -43,7 +73,9 @@ class AiClient:
         llm_model: str = "deepseek-v4-flash",
         tts_model: str = "gemini-3.8-flash-lite-tts",
         tts_voice: str = "Zephyr",
+        asr_language: str = "ru",
         timeout: float = 30.0,
+        ssl_context: Optional[ssl.SSLContext] = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -51,7 +83,45 @@ class AiClient:
         self.llm_model = llm_model
         self.tts_model = tts_model
         self.tts_voice = tts_voice
+        self.asr_language = asr_language
         self.timeout = timeout
+        self._ssl_context = ssl_context or _default_ssl_context()
+
+    @classmethod
+    def from_env(
+        cls, env: Optional[Mapping[str, str]] = None
+    ) -> Optional["AiClient"]:
+        """Создаёт клиент из переменных окружения или возвращает None.
+
+        Поддерживаются как ``OPENAI_*``, так и короткие ``AI_*`` имена.
+        Если URL или ключ не заданы, ASR/LLM/TTS просто отключаются.
+        """
+        source = env if env is not None else os.environ
+
+        def read(*names: str, default: str = "") -> str:
+            for name in names:
+                value = source.get(name)
+                if value:
+                    return value
+            return default
+
+        base_url = read("OPENAI_BASE_URL", "AI_BASE_URL")
+        api_key = read("OPENAI_API_KEY", "AI_API_KEY")
+        if not base_url or not api_key:
+            return None
+
+        return cls(
+            base_url=base_url,
+            api_key=api_key,
+            asr_model=read("ASR_MODEL", "OPENAI_ASR_MODEL", default="whisper-large-v3"),
+            llm_model=read("LLM_MODEL", "OPENAI_LLM_MODEL", default="deepseek-v4-flash"),
+            tts_model=read(
+                "TTS_MODEL", "OPENAI_TTS_MODEL", default="gemini-3.8-flash-lite-tts"
+            ),
+            tts_voice=read("TTS_VOICE", "OPENAI_TTS_VOICE", default="Zephyr"),
+            asr_language=read("ASR_LANGUAGE", "OPENAI_ASR_LANGUAGE", default="ru"),
+            timeout=float(read("AI_TIMEOUT", default="30")),
+        )
 
     def _request(
         self,
@@ -82,7 +152,9 @@ class AiClient:
         )
         logger.debug("AI API %s %s", method, endpoint)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(
+                request, timeout=self.timeout, context=self._ssl_context
+            ) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")[:500]
@@ -95,12 +167,22 @@ class AiClient:
         try:
             return json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError as exc:
-            raise AiClientError(f"екорректный JSON от {endpoint}: {exc}") from exc
+            raise AiClientError(f"Некорректный JSON от {endpoint}: {exc}") from exc
 
-    def transcribe(self, wav_bytes: bytes) -> str:
+    def transcribe(
+        self,
+        wav_bytes: bytes,
+        language: Optional[str] = None,
+        prompt: Optional[str] = None,
+    ) -> str:
         """Распознать речь из WAV s16le. Возвращает текст."""
         boundary = f"----FormBoundary{uuid.uuid4().hex}"
         fields: List[tuple] = [("model", self.asr_model)]
+        language = language if language is not None else self.asr_language
+        if language:
+            fields.append(("language", language))
+        if prompt:
+            fields.append(("prompt", prompt))
         body = self._build_multipart(
             fields,
             file_name="utterance.wav",
@@ -164,7 +246,9 @@ class AiClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(
+                request, timeout=self.timeout, context=self._ssl_context
+            ) as response:
                 wav_bytes = response.read()
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")[:500]

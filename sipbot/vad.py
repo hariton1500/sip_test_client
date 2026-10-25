@@ -1,7 +1,7 @@
 """Энергетический VAD для голосового бота.
 
 Накапливает входящие u8-кадры, определяет начало речи по превышению порога
-RMS и конец речи по тишине. Готовый WAV (s16le, 16 kГц, mono) возвращается
+RMS и конец речи по тишине. Готовый WAV (s16le, 8 kГц, mono) возвращается
 для отправки в ASR.
 """
 
@@ -21,7 +21,7 @@ class EnergyVAD:
         speech_ms: минимальная длительность речи, чтобы считать реплику начавшейся.
         silence_ms: сколько мс тишины считать концом реплики.
         max_utterance_ms: жёсткий лимит длительности реплики.
-        rms_threshold: порог RMS во внутреннем формате u8 (0..128).
+        rms_threshold: порог RMS (0.0..1.0), выше которого кадр считается речью.
     """
 
     def __init__(
@@ -29,7 +29,7 @@ class EnergyVAD:
         speech_ms: int = 300,
         silence_ms: int = 900,
         max_utterance_ms: int = 10000,
-        rms_threshold: int = 12,
+        rms_threshold: float = 0.02,
     ) -> None:
         self.rms_threshold = rms_threshold
         self.speech_frames = max(1, speech_ms // FRAME_MS)
@@ -48,6 +48,11 @@ class EnergyVAD:
         self._speech_count = 0
         self._silence_count = 0
         self._has_speech = False
+
+    @property
+    def has_speech(self) -> bool:
+        """Была ли в текущем буфере зафиксирована речь."""
+        return self._has_speech
 
     def feed(self, frame: bytes) -> bool:
         """Добавить кадр. Возвращает True, если реплика готова к распознаванию."""
@@ -78,7 +83,7 @@ class EnergyVAD:
         return False
 
     def flush(self) -> bytes:
-        """Собрать WAV s16le 16 kГц mono из накопленных u8-кадров и сбросить VAD."""
+        """Собрать WAV s16le 8 kГц mono из накопленных u8-кадров и сбросить VAD."""
         pcm_u8 = b"".join(self._buffer)
         self.reset()
         return _pack_wav(u8_to_s16(pcm_u8), sample_rate=SAMPLE_RATE)

@@ -16,6 +16,43 @@
 Боты (`--bot`): `silence`, `echo`, `tone`, `tone:<Гц>:<мс>`,
 `wav:<путь>[:loop]`. Бот получает входящий кадр и возвращает кадр для отправки.
 
+## Веб-интерфейс с живой расшифровкой
+
+У `incoming` есть локальный веб-интерфейс: реплики абонента распознаются через
+OpenAI-совместимый ASR и появляются в браузере пузырями в реальном времени.
+Ни Flask/FastAPI, ни websockets не нужны — только стандартная библиотека
+(`ThreadingHTTPServer` + Server-Sent Events).
+
+```powershell
+# в .env должны быть OPENAI_BASE_URL и OPENAI_API_KEY
+python main.py incoming --ui
+# открыть http://127.0.0.1:8765/
+```
+
+Параметры:
+
+| Флаг | Назначение |
+|---|---|
+| `--ui` | включить веб-интерфейс и ASR для входящих звонков |
+| `--ui-host 127.0.0.1` | адрес прослушивания (по умолчанию только localhost) |
+| `--ui-port 8765` | порт веб-интерфейса |
+| `--no-asr` | не звать ASR; UI покажет только события звонка |
+
+Как это работает: `MediaBridge` отдаёт 20-мс кадры в `TranscribingBot` →
+`EnergyVAD` находит конец реплики → WAV уходит в `AiClient.transcribe()` в
+фоновом потоке → текст публикуется в `TranscriptStore` → SSE отправляет его
+в браузер. Аудио звонка при этом не блокируется. В интерфейсе есть статус
+линии, Call-ID, счётчик реплик, автоскролл и очистка ленты.
+
+Для проверки на локальном harness можно отправить клиенту настоящую речь:
+
+```powershell
+python scripts/live_incoming.py --bot tone --ui --caller-wav echo_test.wav
+```
+
+Интерфейс по умолчанию слушает только `127.0.0.1`. Если открыть его через
+`--ui-host 0.0.0.0`, встроенной авторизации нет — не публикуйте порт наружу.
+
 ## Ограничения pyVoIP 1.6.8 (важно!)
 
 * только **G.711 (PCMU/PCMA), 8 кГц, моно** — без Opus/G.722;
@@ -148,11 +185,18 @@ sipbot/phone.py         SipPhone: VoIPPhone, регистрация, очере�
 sipbot/media.py         MediaBridge (2 потока: чтение/запись, такт 20 мс)
                         Recorder (потоковая запись в WAV)
 sipbot/bots.py          SilenceBot / EchoBot / ToneBot / WavFileBot + build_bot
+sipbot/vad.py           EnergyVAD: сегментация речи для ASR
+sipbot/transcript.py    TranscriptStore: история реплик + подписки для UI
+sipbot/transcribing_bot.py  обёртка бота: VAD -> ASR -> лента разговора
+sipbot/ui_server.py     HTTP/SSE-сервер веб-интерфейса
+sipbot/ui/index.html    страница с живыми пузырями разговора
+sipbot/ai_client.py     OpenAI-совместимые ASR/LLM/TTS
 sipbot/audio_utils.py   u8 <-> s16, G.711, ресемплинг, WAV, кадры
 sipbot/pyvoip_fixes.py  патчи pyVoIP: 200 OK на OPTIONS, устойчивая регистрация
 scripts/offline_smoke.py  оффлайн-проверка моста и записи на реальном API pyVoIP
+scripts/live_incoming.py  живой harness: локальная АТС + один входящий звонок
 scripts/sip_trace.py    трассировка SIP/RTP по сокетам (диагностика live-тестов)
-tests/                  69 тестов без сети: аудио, боты, мост, конфиг, патчи
+tests/                  80 тестов без сети: аудио, боты, мост, конфиг, патчи, UI
 ```
 
 ### Как устроен обмен звуком
