@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -34,11 +35,35 @@ PathLike = Union[str, Path]
 
 @dataclass(frozen=True)
 class CallerInfo:
-    """Информация о входящем звонке."""
+    """Информация о входящем звонке.
+
+    ``number`` — то, что показываем оператору/используем как Caller ID.
+    У SIP-провайдеров номер часто лежит не в URI, а в display-name, поэтому
+    при наличии телефона в display-name он имеет приоритет.
+    ``sip_user`` — исходный пользователь из SIP URI (для логов/маршрутизации).
+    """
 
     number: str
     display: str
     call_id: str
+    sip_user: str = ""
+
+
+def _clean_header_value(value) -> str:
+    """Убрать пробелы и непарные кавычки, которые оставляет pyVoIP."""
+    text = " ".join(str(value or "").split())
+    text = text.strip()
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    return text.strip("\"' ")
+
+
+def _looks_like_phone(value: str) -> bool:
+    """Похоже ли значение на телефонный номер, а не на имя."""
+    if not value or not re.fullmatch(r"\+?[\d\s().-]{6,}", value):
+        return False
+    digits = re.sub(r"\D", "", value)
+    return 7 <= len(digits) <= 15
 
 
 def caller_info(call: VoIPCall) -> CallerInfo:
@@ -46,10 +71,20 @@ def caller_info(call: VoIPCall) -> CallerInfo:
     request = getattr(call, "request", None)
     headers = getattr(request, "headers", {}) or {}
     from_header = headers.get("From") or {}
-    number = from_header.get("number") or "unknown"
-    display = from_header.get("caller") or ""
+    raw_number = _clean_header_value(from_header.get("number"))
+    sip_user = raw_number or "unknown"
+    display = _clean_header_value(from_header.get("caller"))
+
+    # В живом звонке pyVoIP отдал number='508', а настоящий номер пришёл
+    # в display-name как '+79780481885" '. Для Caller ID важнее телефон.
+    number = display if _looks_like_phone(display) else sip_user
     call_id = getattr(call, "call_id", "?") or "?"
-    return CallerInfo(number=number, display=display, call_id=call_id)
+    return CallerInfo(
+        number=number,
+        display=display,
+        call_id=call_id,
+        sip_user=sip_user,
+    )
 
 
 class CallSession:

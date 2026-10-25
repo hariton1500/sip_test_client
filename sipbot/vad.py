@@ -54,6 +54,16 @@ class EnergyVAD:
         """Была ли в текущем буфере зафиксирована речь."""
         return self._has_speech
 
+    @property
+    def speech_active(self) -> bool:
+        """Идёт ли сейчас непрерывный участок речи (для barge-in)."""
+        return self._speech_count >= self.speech_frames
+
+    @property
+    def silence_ms(self) -> int:
+        """Сколько тишины VAD требует для завершения реплики."""
+        return self.silence_frames * FRAME_MS
+
     def feed(self, frame: bytes) -> bool:
         """Добавить кадр. Возвращает True, если реплика готова к распознаванию."""
         if self._closed:

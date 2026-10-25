@@ -85,14 +85,15 @@ class MediaBridge:
         bot: Optional[Bot] = None,
         recorder: Optional[Recorder] = None,
         frame_bytes: int = FRAME_BYTES,
-        max_queue: int = 50,
     ) -> None:
         self._call = call
         self._bot = bot
         self._recorder = recorder
         self._frame_bytes = frame_bytes
         self._pace = FRAME_MS / 1000.0
-        self._out: "queue.Queue[bytes]" = queue.Queue(maxsize=max_queue)
+        # Очередь не ограничена: приветствие/TTS может быть длиннее секунды.
+        # Раньше maxsize=50 обрезал всё, что не успевало уйти за 1 секунду.
+        self._out: "queue.Queue[bytes]" = queue.Queue()
         self._stop = threading.Event()
         self._threads = []
 
@@ -105,10 +106,28 @@ class MediaBridge:
     # Управление
     # ------------------------------------------------------------------
     def inject(self, data: bytes) -> None:
-        """Помещает сырую последовательность байт в исходящую очередь по кадрам."""
+        """Поставить все кадры аудио в очередь без потерь.
+
+        Метод можно вызывать до ``start()``: очередь не ограничена, а writer
+        начнёт отдавать кадры с тактом 20 мс после запуска.
+        """
         for offset in range(0, len(data), self._frame_bytes):
             frame = data[offset : offset + self._frame_bytes]
             self._put_out(frame)
+
+    def clear_outgoing(self) -> int:
+        """Убрать ещё не отправленное аудио (например, при перебивании).
+
+        Возвращает количество отброшенных кадров.
+        """
+        cleared = 0
+        while True:
+            try:
+                self._out.get_nowait()
+            except queue.Empty:
+                break
+            cleared += 1
+        return cleared
 
     def start(self) -> None:
         for target, name in (
@@ -134,6 +153,7 @@ class MediaBridge:
             "frames_in": self.frames_in,
             "frames_out": self.frames_out,
             "dropped": self.dropped,
+            "queued": self._out.qsize(),
             "level": round(self.last_level, 4),
         }
 
@@ -154,20 +174,8 @@ class MediaBridge:
         return frame + bytes([SILENCE_BYTE]) * (size - len(frame))
 
     def _put_out(self, frame: bytes) -> None:
-        frame = self._fit(frame, self._frame_bytes)
-        try:
-            self._out.put_nowait(frame)
-        except queue.Full:
-            try:
-                self._out.get_nowait()
-                self.dropped += 1
-            except queue.Empty:
-                pass
-            try:
-                self._out.put_nowait(frame)
-            except queue.Full:
-                self.dropped += 1
-                logger.debug("Очередь на отправку переполнена, кадр отброшен")
+        # Очередь не ограничена по размеру, поэтому кадры не теряются.
+        self._out.put(self._fit(frame, self._frame_bytes))
 
     def _read_loop(self) -> None:
         next_tick = time.monotonic()
