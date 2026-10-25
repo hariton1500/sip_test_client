@@ -164,7 +164,7 @@ class DialogBot:
         config: Optional[DialogConfig] = None,
         vad: Optional[EnergyVAD] = None,
         tts: Optional[TtsService] = None,
-        greeting_audio: bytes = b"",
+        greeting_audio: Optional[bytes] = None,
         language: Optional[str] = None,
         asr_prompt: Optional[str] = None,
     ) -> None:
@@ -220,12 +220,16 @@ class DialogBot:
             self._worker.start()
 
         if self._greeting:
-            audio = self._greeting_audio
-            if not audio:
+            if self._greeting_audio is None:
                 try:
                     audio = self._tts.preload(self._greeting)
                 except Exception:  # noqa: BLE001 - звонок не должен падать из-за TTS
                     logger.exception("Не удалось синтезировать приветствие")
+                    audio = b""
+            else:
+                # Пустой bytes означает «синтез уже пробовали и он не удался»;
+                # не повторяем сетевой вызов на каждом звонке.
+                audio = self._greeting_audio
             if audio:
                 self._enqueue_audio(audio)
                 self._publish(BOT, self._greeting)
@@ -425,7 +429,8 @@ class DialogBot:
 
         with self._lock:
             if self._closed.is_set() or utterance.epoch != self._epoch:
-                logger.info("Ответ отменён перебиванием [%s]", self._call_id)
+                reason = "звонок завершён" if self._closed.is_set() else "перебивание"
+                logger.info("Ответ отменён (%s) [%s]", reason, self._call_id)
                 return
             self._history.append({"role": "assistant", "content": content})
             self._trim_history_locked()
@@ -444,7 +449,8 @@ class DialogBot:
 
         with self._lock:
             if self._closed.is_set() or utterance.epoch != self._epoch:
-                logger.info("TTS отменён перебиванием [%s]", self._call_id)
+                reason = "звонок завершён" if self._closed.is_set() else "перебивание"
+                logger.info("TTS отменён (%s) [%s]", reason, self._call_id)
                 return
             self._enqueue_audio(audio)
 

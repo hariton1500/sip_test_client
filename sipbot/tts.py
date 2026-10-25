@@ -17,7 +17,7 @@ import threading
 import wave
 from collections import OrderedDict
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 
@@ -26,6 +26,17 @@ from .audio_utils import SAMPLE_RATE, resample_s16, s16_to_u8
 logger = logging.getLogger(__name__)
 
 PathLike = Union[str, Path]
+
+
+def pcm_s16_to_wav_bytes(pcm_s16: bytes, rate: int) -> bytes:
+    """Упаковать raw s16le PCM в WAV bytes (для единого дискового кэша)."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(pcm_s16)
+    return buffer.getvalue()
 
 
 def wav_bytes_to_pcm(data: bytes) -> Tuple[bytes, int]:
@@ -85,10 +96,22 @@ class TtsService:
         self.ai = ai
         self.cache_dir = Path(cache_dir).expanduser() if cache_dir else None
         if self.cache_dir is not None:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                logger.warning(
+                    "Не удалось создать TTS-кэш %s, работаю без диска",
+                    self.cache_dir,
+                    exc_info=True,
+                )
+                self.cache_dir = None
         self.max_memory_items = max(1, max_memory_items)
         self._memory: "OrderedDict[str, bytes]" = OrderedDict()
         self._lock = threading.RLock()
+        # Разные фразы можно синтезировать параллельно (важно для нескольких
+        # линий); одинаковые — ждут один сетевой вызов.
+        self._key_locks: Dict[str, threading.Lock] = {}
+        self._key_locks_guard = threading.Lock()
 
     def audio_u8(self, text: str) -> bytes:
         """Синтезировать текст и вернуть u8 PCM 8 кГц (формат pyVoIP)."""
@@ -103,13 +126,29 @@ class TtsService:
                 self._memory.move_to_end(key)
                 return cached
 
+        with self._key_lock(key):
+            with self._lock:
+                cached = self._memory.get(key)
+                if cached is not None:
+                    self._memory.move_to_end(key)
+                    return cached
+
             pcm_s16, rate = self._load_or_synthesize(key, text)
             audio = s16_to_u8(resample_s16(pcm_s16, rate, SAMPLE_RATE))
-            self._memory[key] = audio
-            self._memory.move_to_end(key)
-            while len(self._memory) > self.max_memory_items:
-                self._memory.popitem(last=False)
+            with self._lock:
+                self._memory[key] = audio
+                self._memory.move_to_end(key)
+                while len(self._memory) > self.max_memory_items:
+                    self._memory.popitem(last=False)
             return audio
+
+    def _key_lock(self, key: str) -> threading.Lock:
+        with self._key_locks_guard:
+            lock = self._key_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._key_locks[key] = lock
+            return lock
 
     def preload(self, text: str) -> bytes:
         """Заранее синтезировать фразу (например, приветствие)."""
@@ -129,8 +168,20 @@ class TtsService:
             except (OSError, ValueError):
                 logger.warning("Повреждён TTS-кэш %s, синтезирую заново", path)
 
-        wav_bytes = self.ai.synthesize(text)
-        pcm_s16, rate = wav_bytes_to_pcm(wav_bytes)
+        raw = self.ai.synthesize(text)
+        if raw[:4] == b"RIFF":
+            wav_bytes = raw
+            pcm_s16, rate = wav_bytes_to_pcm(wav_bytes)
+        else:
+            # AiTunnel для gemini-*-tts отдаёт raw pcm, а не WAV.
+            rate = int(getattr(self.ai, "tts_sample_rate", 24000) or 24000)
+            if len(raw) % 2:
+                raw = raw[:-1]
+            pcm_s16 = raw
+            if not pcm_s16:
+                raise ValueError("TTS вернул пустой PCM")
+            wav_bytes = pcm_s16_to_wav_bytes(pcm_s16, rate)
+
         if path is not None:
             try:
                 self._write_atomic(path, wav_bytes)
@@ -162,4 +213,4 @@ class TtsService:
                     pass
 
 
-__all__ = ["TtsService", "wav_bytes_to_pcm"]
+__all__ = ["TtsService", "pcm_s16_to_wav_bytes", "wav_bytes_to_pcm"]

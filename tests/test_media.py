@@ -142,18 +142,27 @@ def test_bridge_pads_short_bot_frames():
     assert call.written[0].startswith(b"\x01\x02")
 
 
-def test_put_out_drops_oldest_when_queue_full():
-    bridge = MediaBridge(FakeCall(), max_queue=2)
-    first, second, third = (bytes([value]) * 160 for value in (1, 2, 3))
+def test_inject_keeps_long_audio_without_drops():
+    bridge = MediaBridge(FakeCall())
+    first, second = bytes([1]) * 160, bytes([2]) * 160
+    long_audio = first + second + b"\x03" * 160 * 298  # 6 секунд
 
-    for frame in (first, second, third):
-        bridge._put_out(frame)
+    bridge.inject(long_audio)
 
-    assert bridge.dropped == 1
-    assert bridge._out.qsize() == 2
-    # самый старый кадр выброшен, очередь сохраняет порядок
+    assert bridge.dropped == 0
+    assert bridge._out.qsize() == 300
+    assert bridge.stats()["queued"] == 300
+    assert bridge._out.get_nowait() == first
     assert bridge._out.get_nowait() == second
-    assert bridge._out.get_nowait() == third
+
+
+def test_clear_outgoing_discards_pending_audio():
+    bridge = MediaBridge(FakeCall())
+    bridge.inject(b"\x01" * 160 * 5)
+
+    assert bridge.clear_outgoing() == 5
+    assert bridge._out.qsize() == 0
+    assert bridge.clear_outgoing() == 0
 
 
 def test_build_bot_variants(tmp_path):

@@ -599,7 +599,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bot",
         default="tone",
-        help="бот клиента: tone|placeholder|echo|silence (по умолчанию tone)",
+        help=(
+            "бот клиента: tone|placeholder|echo|silence|ai "
+            "(по умолчанию tone; ai требует OPENAI_* и TTS)"
+        ),
     )
     parser.add_argument(
         "--caller-wav",

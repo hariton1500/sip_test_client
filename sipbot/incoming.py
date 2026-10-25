@@ -193,11 +193,16 @@ class CallSession:
             self.recorder.close()
 
         if self.bot is not None:
+            # on_call_ended и close разделены: если финальная реплика/сеть
+            # упадут, close всё равно освободит потоки и очередь.
             try:
                 self.bot.on_call_ended()
+            except Exception:  # noqa: BLE001
+                logger.exception("Ошибка завершения бота")
+            try:
                 self.bot.close()
             except Exception:  # noqa: BLE001
-                logger.exception("Ошибка остановки бота")
+                logger.exception("Ошибка закрытия бота")
 
         # Если звонок всё ещё не сброшен — принудительно положим трубку.
         try:

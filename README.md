@@ -1,9 +1,10 @@
 # SIP test client (pyVoIP) для голосового бота
 
 Минимальный SIP-клиент на Python: регистрация на АТС, входящие и исходящие
-звонки, запись разговора в WAV, эхо-бот и бот-проигрыватель WAV.
-Задуман как «испытательный стенд»: SIP-транспорт отделён от обработки звука,
-поэтому VAD/ASR/LLM/TTS подключаются без переделки сети.
+звонки, запись разговора в WAV, эхо-бот, бот-проигрыватель WAV и голосовой
+диалоговый бот `VAD → ASR → LLM → TTS`. Задуман как «испытательный стенд»:
+SIP-транспорт отделён от обработки звука, поэтому сеть не нужно переделывать
+при замене модели/промпта/голоса.
 
 ## Что умеет
 
@@ -12,12 +13,13 @@
 | `register` | только регистрация (проверка логина/пароля/сети) |
 | `listen` | принимать входящие, отвечать, писать в WAV, запускать бота |
 | `dial` | исходящий звонок, проигрывание WAV, запись ответа |
-| `incoming` | многоканальный приём входящих, запись каждого звонка, опционально UI+ASR |
+| `incoming` | многоканальный приём, запись, UI+ASR и AI-диалог с TTS-приветствием |
 
-Боты (`--bot`): `silence`, `echo`, `tone`, `tone:<Гц>:<мс>`,
+Боты (`--bot`): `auto`, `ai`, `silence`, `echo`, `tone`, `tone:<Гц>:<мс>`,
 `wav:<путь>[:loop]`, `placeholder`, `placeholder:<мс>`. Бот получает входящий
-кадр и возвращает кадр для отправки. Полные таблицы ключей — в разделе
-«Запуск и ключи».
+кадр и возвращает кадр для отправки. `auto`/`ai` доступны в `incoming`:
+`auto` выбирает диалогового бота, если настроены ASR/LLM/TTS. Полные таблицы
+ключей — в разделе «Запуск и ключи».
 
 Отдельные точки входа: `scripts/prompt_editor.py` (редактор промптов),
 `scripts/live_incoming.py` (локальный harness входящего звонка),
@@ -46,16 +48,22 @@ python main.py incoming --ui
 | `--ui-port 8765` | порт веб-интерфейса |
 | `--no-asr` | не звать ASR; UI покажет только события звонка |
 
-Как это работает: `MediaBridge` отдаёт 20-мс кадры в `TranscribingBot` →
-`EnergyVAD` находит конец реплики → WAV уходит в `AiClient.transcribe()` в
-фоновом потоке → текст публикуется в `TranscriptStore` → SSE отправляет его
-в браузер. Аудио звонка при этом не блокируется. В интерфейсе есть статус
+Как это работает: `MediaBridge` отдаёт 20-мс кадры в `DialogBot` (или в
+`TranscribingBot` для обычного бота) → `EnergyVAD` находит конец реплики →
+WAV уходит в `AiClient.transcribe()` в фоновом потоке → текст попадает в
+историю диалога и `TranscriptStore` → `AiClient.chat()` формирует ответ →
+TTS синтезируется и проигрывается по кадрам → SSE отправляет реплики в
+браузер. Аудио звонка при этом не блокируется. В интерфейсе есть статус
 линии, Call-ID, счётчик реплик, автоскролл и очистка ленты.
+
+Для AI-диалога (по умолчанию `--bot auto`) при старте один раз синтезируется
+и кэшируется приветствие `AI_GREETING`. Если ASR/LLM/TTS не настроены,
+`auto` откатывается на `placeholder` с предупреждением в логе.
 
 Для проверки на локальном harness можно отправить клиенту настоящую речь:
 
 ```powershell
-python scripts/live_incoming.py --bot tone --ui --caller-wav echo_test.wav
+python scripts/live_incoming.py --bot ai --ui --caller-wav echo_test.wav
 ```
 
 Интерфейс по умолчанию слушает только `127.0.0.1`. Если открыть его через
@@ -230,7 +238,28 @@ OPENAI_BASE_URL=https://api.aitunnel.ru/v1
 OPENAI_API_KEY=
 ASR_MODEL=whisper-large-v3
 ASR_LANGUAGE=ru
+LLM_MODEL=deepseek-v4-flash
 AI_TIMEOUT=30
+
+# --- TTS ---
+TTS_MODEL=tts-1
+TTS_VOICE=nova
+# AiTunnel/gemini требуют pcm; если провайдер отдаёт WAV, поставьте wav.
+TTS_RESPONSE_FORMAT=pcm
+TTS_SAMPLE_RATE=24000
+TTS_TIMEOUT=20
+TTS_CACHE_DIR=cache/tts
+
+# --- Голосовой диалог (incoming --bot auto/ai) ---
+AI_GREETING=Здравствуйте! Вы позвонили в службу поддержки. Чем я могу вам помочь?
+AI_FALLBACK_REPLY=Извините, не удалось получить ответ. Повторите, пожалуйста.
+VAD_SPEECH_MS=200
+VAD_SILENCE_MS=900
+VAD_MAX_UTTERANCE_MS=10000
+VAD_RMS_THRESHOLD=0.02
+DIALOG_HISTORY_TURNS=12
+DIALOG_MAX_REPLY_CHARS=1200
+DIALOG_BARGE_IN=1
 ```
 
 Дополнительные переменные AI-клиента (все необязательны):
@@ -243,10 +272,29 @@ AI_TIMEOUT=30
 | `LLM_MODEL` / `OPENAI_LLM_MODEL` | `deepseek-v4-flash` | модель LLM |
 | `TTS_MODEL` / `OPENAI_TTS_MODEL` | `gemini-3.8-flash-lite-tts` | модель TTS |
 | `TTS_VOICE` / `OPENAI_TTS_VOICE` | `Zephyr` | голос TTS |
+| `TTS_RESPONSE_FORMAT` | `pcm` | формат ответа TTS: `pcm` (raw s16le) или `wav` |
+| `TTS_SAMPLE_RATE` | `24000` | частота raw PCM от TTS до ресемплинга в 8 кГц |
+| `TTS_TIMEOUT` | `20` | таймаут одного запроса TTS, с |
+| `TTS_CACHE_DIR` | `cache/tts` | дисковый кэш WAV; пустое значение отключает кэш |
+| `AI_GREETING` | встроенная фраза | TTS-приветствие в начале звонка; пусто — без приветствия |
+| `AI_FALLBACK_REPLY` | «Извините…» | фраза при ошибке LLM |
+| `VAD_SPEECH_MS` | `200` | сколько речи подтверждает начало реплики |
+| `VAD_SILENCE_MS` | `900` | сколько тишины завершает реплику |
+| `VAD_MAX_UTTERANCE_MS` | `10000` | максимальная длина реплики |
+| `VAD_RMS_THRESHOLD` | `0.02` | порог энергии речи (0.0–1.0) |
+| `DIALOG_HISTORY_TURNS` | `12` | сколько пар «вопрос-ответ» держать в контексте LLM |
+| `DIALOG_MAX_REPLY_CHARS` | `1200` | ограничение длины ответа для TTS |
+| `DIALOG_BARGE_IN` | `1` | останавливать ответ, когда абонент начинает говорить |
 | `OPENAI_ASR_LANGUAGE` | `ru` | синоним `ASR_LANGUAGE` |
 | `SYSTEM_PROMPT_FILES` | все 4 файла из `prompts/` | список файлов system prompt |
 | `SYSTEM_PROMPT_FILE` | — | устаревший одиночный файл (fallback) |
 | `SSL_CERT_FILE` | системный | путь к CA-файлу для HTTPS к AI-API |
+
+TTS-кэш хранит WAV целиком, поэтому приветствие синтезируется один раз, а
+повторные фразы (например, «Извините…») не тратят запрос. Ключ кэша включает
+модель, голос и текст. `TTS_RESPONSE_FORMAT=pcm` — обязательный вариант для
+`gemini-*-tts` в AiTunnel; для OpenAI `tts-1` он тоже поддерживается. Если
+провайдер вернёт WAV, `TtsService` определит это по заголовку `RIFF`.
 
 Если `OPENAI_BASE_URL`/`OPENAI_API_KEY` (или их `AI_*` синонимы) не заданы,
 ASR/LLM/TTS отключаются; `incoming --ui` работает, но без расшифровки.
@@ -373,32 +421,36 @@ python main.py incoming [--bot SPEC] [--record-dir DIR] [--max-lines N] [--ui]
 
 | Ключ | По умолчанию | Назначение |
 |---|---|---|
-| `--bot SPEC` | `placeholder` | обработчик каждого звонка (см. «Боты») |
+| `--bot SPEC` | `auto` | обработчик каждого звонка (см. «Боты»); `auto` = `ai`, если AI настроен, иначе `placeholder` |
 | `--record-dir DIR` | `recordings` | каталог для WAV каждого входящего звонка |
 | `--max-lines N` | `MAX_INCOMING_LINES` (`16`) | сколько звонков обслуживать одновременно |
 | `--ui` | выкл. | включить веб-интерфейс и живую расшифровку (ASR) |
 | `--ui-host HOST` | `127.0.0.1` | адрес веб-интерфейса |
 | `--ui-port PORT` | `8765` | порт веб-интерфейса |
-| `--no-asr` | выкл. | не распознавать речь; UI покажет только события звонка |
+| `--no-asr` | выкл. | отключить ASR и AI-бота; UI покажет только события звонка |
 
 `incoming` работает до `Ctrl+C` и не завершается после первого звонка. Каждый
 звонок пишется отдельным WAV в `--record-dir`. `--max-lines` не должен
-превышать число портов в `RTP_PORT_LOW..RTP_PORT_HIGH`. Для `--ui` нужны
-`OPENAI_BASE_URL` и `OPENAI_API_KEY`; без них используйте `--no-asr` либо
-запускайте без `--ui`.
+превышать число портов в `RTP_PORT_LOW..RTP_PORT_HIGH`. Для AI-диалога нужны
+`OPENAI_BASE_URL`/`OPENAI_API_KEY`, файлы из `SYSTEM_PROMPT_FILES` и рабочий
+TTS. Если TTS недоступен, бот всё равно запустится, но приветствие будет
+пустым — причина попадёт в лог.
 
 ```powershell
-# минимальный многоканальный приём без веба
-python main.py incoming --bot placeholder --record-dir recordings --max-lines 4
+# AI-диалог: приветствие, ASR, LLM, TTS и веб-лента (рекомендуется)
+python main.py incoming --ui --max-lines 1
 
-# веб-интерфейс + ASR + эхо; удобно для проверки входящего звонка
+# явно выбрать AI-бота без веб-интерфейса
+python main.py incoming --bot ai --record-dir recordings
+
+# эхо + ASR в UI без LLM; удобно для проверки входящего звука
 python main.py incoming --ui --bot echo --max-lines 1
 
 # только события звонка в UI, без обращения к ASR
 python main.py incoming --ui --no-asr --ui-port 9000
 
-# приветствие в цикле всем звонящим
-python main.py incoming --bot wav:greeting.wav:loop --record-dir recordings
+# обычный WAV-бот без AI
+python main.py incoming --bot placeholder --record-dir recordings --max-lines 4
 ```
 
 После запуска с `--ui` откройте `http://127.0.0.1:8765/` (или свой `--ui-port`).
@@ -408,6 +460,8 @@ python main.py incoming --bot wav:greeting.wav:loop --record-dir recordings
 
 | Спецификация | Поведение |
 |---|---|
+| `auto` | в `incoming`: AI-диалог, если настроены ASR/LLM/TTS, иначе `placeholder` |
+| `ai` | в `incoming`: `DialogBot` — VAD → ASR → LLM → TTS, приветствие и barge-in |
 | `silence` | ничего не отправляет (в `listen` это значение по умолчанию) |
 | `echo` | возвращает входящий звук обратно |
 | `tone` | тон 1000 Гц по 300 мс с паузой 2700 мс |
@@ -418,8 +472,9 @@ python main.py incoming --bot wav:greeting.wav:loop --record-dir recordings
 | `placeholder:<мс>` | приветствие заданной длительности, затем молчит |
 
 WAV ресемплируется в 8 кГц. В `dial` ключ `--play FILE` — это сокращение для
-`--bot wav:FILE` без цикла. Неизвестная спецификация завершает запуск ошибкой
-конфигурации.
+`--bot wav:FILE` без цикла. `auto`/`ai` работают только в `incoming`; для
+`listen`/`dial` используйте обычные боты. Неизвестная спецификация завершает
+запуск ошибкой конфигурации.
 
 ### `scripts/prompt_editor.py` — отдельный редактор промптов
 
@@ -539,9 +594,11 @@ sipbot/phone.py         SipPhone: VoIPPhone, регистрация, очере�
 sipbot/media.py         MediaBridge (2 потока: чтение/запись, такт 20 мс)
                         Recorder (потоковая запись в WAV)
 sipbot/bots.py          SilenceBot / EchoBot / ToneBot / PlaceholderBot / WavFileBot + build_bot
-sipbot/vad.py           EnergyVAD: сегментация речи для ASR
+sipbot/vad.py           EnergyVAD: сегментация речи для ASR и barge-in
 sipbot/transcript.py    TranscriptStore: история реплик + подписки для UI
-sipbot/transcribing_bot.py  обёртка бота: VAD -> ASR -> лента разговора
+sipbot/transcribing_bot.py  обёртка обычного бота: VAD -> ASR -> лента разговора
+sipbot/dialog.py        DialogBot: VAD -> ASR -> LLM -> TTS, история, метрики
+sipbot/tts.py           TtsService: raw PCM/WAV -> 8 кГц, дисковый кэш
 sipbot/prompts.py       безопасное чтение/создание/атомарное сохранение промптов
 sipbot/prompt_ui_server.py  HTTP-сервер редактора промптов
 sipbot/prompt_ui/index.html страница редактора с Markdown-просмотром
@@ -554,7 +611,7 @@ scripts/offline_smoke.py  оффлайн-проверка моста и запи
 scripts/live_incoming.py  живой harness: локальная АТС + один входящий звонок
 scripts/prompt_editor.py  отдельный запуск веб-редактора промптов
 scripts/sip_trace.py    трассировка SIP/RTP по сокетам (диагностика live-тестов)
-tests/                  84 теста без сети: аудио, боты, мост, конфиг, патчи, UI
+tests/                  107 тестов без сети: аудио, боты, диалог, TTS, мост, UI
 ```
 
 ### Как устроен обмен звуком
@@ -566,8 +623,13 @@ tests/                  84 теста без сети: аудио, боты, м�
                                                                           │
                                                     Bot.on_frame() ───────┤
                                                                           ▼
-АТС <──RTP── pyVoIP <──write_audio(160)── очередь (drop-oldest) ── MediaBridge
+АТС <──RTP── pyVoIP <──write_audio(160)── очередь без потерь ───── MediaBridge
 ```
+
+`MediaBridge` пишет тишину, когда у бота нет кадра, и держит исходящую
+очередь неограниченной: длинное TTS-приветствие не обрезается. `DialogBot`
+при этом отдаёт TTS по одному кадру на входящий кадр, поэтому очередь не
+растёт, а при перебивании несыгранные кадры можно выбросить.
 
 Чтение **неблокирующее** и пейсится ровно 20 мс на кадр. Так запись сохраняет
 реальный таймлайн (тишина тоже попадает в WAV), а бот получает равномерный
@@ -652,11 +714,15 @@ python scripts/sip_trace.py 8 --debug --stack  # хуки register() + стек 
 
 ## Что дальше
 
-1. **VAD + ASR**: в `MediaBridge._read_loop` кадры уже приходят по 20 мс;
-   подключите `webrtcvad`/`silero-vad`, затем Whisper (faster-whisper) — только
-   на сегментах речи.
-2. **TTS**: синтез в 8 кГц (или 16/24 кГц + `resample_s16`) и `WavFileBot`-подобная
-   очередь; стриминг — тем же способом, что `ToneBot`.
+1. **Качество VAD/ASR**: сейчас `EnergyVAD` и Whisper Large; для шумной линии
+   имеет смысл `webrtcvad`/Silero и streaming ASR, чтобы отвечать до паузы 900 мс.
+2. **Скорость TTS**: ответ синтезируется целиком, поэтому задержка =
+   ASR + LLM + TTS. Следующий шаг — потоковый TTS по предложениям и/или
+   параллельный синтез, чтобы первый звук пошёл раньше. Логи `Задержка ответа`
+   показывают ASR/LLM/TTS/итог по каждой реплике. На живом локальном звонке
+   через AiTunnel замер был таким: ASR 1.3 с, LLM 3.1 с, TTS 3.5 с, итого
+   8.8 с от конца речи до первого кадра ответа. Цифры зависят от провайдера и
+   длины ответа, но общий вывод один: для телефонии нужен streaming TTS.
 3. **Микрофон/колонки**: `sounddevice` уже в зависимостях; нужен ресемплер
    48 кГц <-> 8 кГц (`resample_s16` есть) и подавление эха (иначе петля).
 4. **DTMF**: в pyVoIP 1.6.8 исходящего DTMF нет — либо патч RTP (RFC 4733),

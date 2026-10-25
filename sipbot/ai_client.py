@@ -73,6 +73,9 @@ class AiClient:
         llm_model: str = "deepseek-v4-flash",
         tts_model: str = "gemini-3.8-flash-lite-tts",
         tts_voice: str = "Zephyr",
+        tts_response_format: str = "pcm",
+        tts_sample_rate: int = 24000,
+        tts_timeout: float = 20.0,
         asr_language: str = "ru",
         timeout: float = 30.0,
         ssl_context: Optional[ssl.SSLContext] = None,
@@ -83,6 +86,9 @@ class AiClient:
         self.llm_model = llm_model
         self.tts_model = tts_model
         self.tts_voice = tts_voice
+        self.tts_response_format = tts_response_format
+        self.tts_sample_rate = tts_sample_rate
+        self.tts_timeout = tts_timeout
         self.asr_language = asr_language
         self.timeout = timeout
         self._ssl_context = ssl_context or _default_ssl_context()
@@ -105,6 +111,20 @@ class AiClient:
                     return value
             return default
 
+        def read_int(name: str, default: int) -> int:
+            try:
+                return int(read(name, default=str(default)))
+            except ValueError:
+                logger.warning("Некорректное %s=%r, использую %d", name, source.get(name), default)
+                return default
+
+        def read_float(name: str, default: float) -> float:
+            try:
+                return float(read(name, default=str(default)))
+            except ValueError:
+                logger.warning("Некорректное %s=%r, использую %.2f", name, source.get(name), default)
+                return default
+
         base_url = read("OPENAI_BASE_URL", "AI_BASE_URL")
         api_key = read("OPENAI_API_KEY", "AI_API_KEY")
         if not base_url or not api_key:
@@ -119,8 +139,13 @@ class AiClient:
                 "TTS_MODEL", "OPENAI_TTS_MODEL", default="gemini-3.8-flash-lite-tts"
             ),
             tts_voice=read("TTS_VOICE", "OPENAI_TTS_VOICE", default="Zephyr"),
+            tts_response_format=read(
+                "TTS_RESPONSE_FORMAT", "OPENAI_TTS_RESPONSE_FORMAT", default="pcm"
+            ),
+            tts_sample_rate=read_int("TTS_SAMPLE_RATE", 24000),
+            tts_timeout=read_float("TTS_TIMEOUT", 20.0),
             asr_language=read("ASR_LANGUAGE", "OPENAI_ASR_LANGUAGE", default="ru"),
-            timeout=float(read("AI_TIMEOUT", default="30")),
+            timeout=read_float("AI_TIMEOUT", 30.0),
         )
 
     def _request(
@@ -226,12 +251,17 @@ class AiClient:
         return ChatResponse(content=content, tool_calls=tool_calls)
 
     def synthesize(self, text: str) -> bytes:
-        """Синтезировать речь. Возвращает WAV PCM 16-bit mono."""
+        """Синтезировать речь.
+
+        Формат ответа задаёт ``TTS_RESPONSE_FORMAT`` (по умолчанию ``pcm``:
+        raw s16le mono с частотой ``TTS_SAMPLE_RATE``). Провайдер может вернуть
+        WAV независимо от запроса — ``TtsService`` определяет это по заголовку.
+        """
         payload = {
             "model": self.tts_model,
             "voice": self.tts_voice,
             "input": text,
-            "response_format": "wav",
+            "response_format": self.tts_response_format,
         }
         url = f"{self.base_url}/audio/speech"
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -247,7 +277,7 @@ class AiClient:
         )
         try:
             with urllib.request.urlopen(
-                request, timeout=self.timeout, context=self._ssl_context
+                request, timeout=self.tts_timeout, context=self._ssl_context
             ) as response:
                 wav_bytes = response.read()
         except urllib.error.HTTPError as exc:
@@ -258,7 +288,9 @@ class AiClient:
         except Exception as exc:
             raise AiClientError(f"Ошибка TTS: {exc}") from exc
 
-        logger.debug("TTS: %d байт", len(wav_bytes))
+        logger.debug(
+            "TTS: %d байт, формат=%s", len(wav_bytes), self.tts_response_format
+        )
         return wav_bytes
 
     @staticmethod

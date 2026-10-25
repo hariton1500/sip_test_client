@@ -6,7 +6,7 @@
     python main.py listen --record in.wav --bot echo
     python main.py dial 1001 --play greeting.wav --record out.wav --duration 20
     python main.py dial 1001 --bot tone --duration 10
-    python main.py incoming --bot placeholder --record-dir ./recordings --max-lines 16
+    python main.py incoming --record-dir ./recordings --max-lines 16
 """
 
 from __future__ import annotations
@@ -15,19 +15,24 @@ import argparse
 import logging
 import sys
 import time
-from typing import Optional
+from pathlib import Path
+from typing import Callable, Optional
 
 from sipbot.ai_client import AiClient
-from sipbot.bots import build_bot
+from sipbot.bots import Bot, build_bot
 from sipbot.config import Settings
+from sipbot.dialog import DialogBot, DialogConfig
 from sipbot.incoming import IncomingDispatcher
 from sipbot.media import MediaBridge, Recorder
 from sipbot.phone import SipPhone
+from sipbot.prompts import PromptStore
 from sipbot.transcript import SYSTEM, TranscriptStore
 from sipbot.transcribing_bot import TranscribingBot
+from sipbot.tts import TtsService
 from sipbot.ui_server import start_ui_server
 
 logger = logging.getLogger("sipbot")
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def setup_logging(verbose: bool) -> None:
@@ -42,6 +47,59 @@ def load_settings(args: argparse.Namespace) -> Settings:
     settings = Settings.from_env(args.env)
     settings.validate()
     return settings
+
+
+def load_dialog_prompt() -> str:
+    """Собрать system prompt из prompts/ по SYSTEM_PROMPT_FILES."""
+    store = PromptStore(PROJECT_ROOT / "prompts")
+    bundle = store.load_system_prompt_from_env()
+    logger.info(
+        "System prompt: %s (%.1f КБ)",
+        ", ".join(bundle.names),
+        bundle.size / 1024.0,
+    )
+    return bundle.content
+
+
+def build_dialog_factory(
+    ai: AiClient,
+    store: Optional[TranscriptStore],
+    system_prompt: str,
+    config: DialogConfig,
+) -> Callable[[], DialogBot]:
+    """Создать фабрику диалоговых ботов с общим TTS-кэшем.
+
+    Приветствие синтезируется один раз при старте (и кэшируется на диск), а не
+    на каждом входящем звонке. Если TTS недоступен, клиент продолжает работать:
+    бот ответит на реплики, а в лог попадёт ошибка синтеза приветствия.
+    """
+    tts = TtsService(ai, cache_dir=config.tts_cache_dir)
+    greeting_audio = b""
+    if config.greeting:
+        try:
+            logger.info("Синтез приветствия: %r", config.greeting[:80])
+            greeting_audio = tts.preload(config.greeting)
+            logger.info(
+                "Приветствие готово: %.1f с аудио",
+                len(greeting_audio) / 8000.0,
+            )
+        except Exception:  # noqa: BLE001 - без TTS клиент всё равно полезен
+            logger.exception(
+                "Не удалось синтезировать приветствие; проверьте TTS_MODEL, "
+                "TTS_VOICE и доступность OPENAI_BASE_URL"
+            )
+
+    def factory() -> DialogBot:
+        return DialogBot(
+            ai,
+            system_prompt,
+            store=store,
+            config=config,
+            tts=tts,
+            greeting_audio=greeting_audio,
+        )
+
+    return factory
 
 
 def start_phone(settings: Settings, timeout: float) -> SipPhone:
@@ -139,12 +197,47 @@ def cmd_incoming(settings: Settings, args: argparse.Namespace) -> int:
         )
         settings.validate()
 
-    store = None
-    ai = None
+    dialog_config = DialogConfig.from_env()
+    raw_bot = (args.bot or "auto").strip()
+    requested_bot = raw_bot.lower() if raw_bot.lower() in ("auto", "ai") else raw_bot
+    store = TranscriptStore() if args.ui else None
+    ai = None if args.no_asr else AiClient.from_env()
+    dialog_factory = None
+    chosen_bot = requested_bot
+
+    if requested_bot in ("auto", "ai"):
+        if args.no_asr:
+            if requested_bot == "ai":
+                logger.error("--bot ai несовместим с --no-asr: диалогу нужен ASR")
+                return 2
+            logger.warning("AI-бот отключён ключом --no-asr, использую placeholder")
+            chosen_bot = "placeholder"
+        elif ai is None:
+            if requested_bot == "ai":
+                logger.error(
+                    "AI-бот не настроен: задайте OPENAI_BASE_URL и OPENAI_API_KEY"
+                )
+                return 2
+            logger.warning(
+                "AI не настроен (OPENAI_BASE_URL/OPENAI_API_KEY), "
+                "использую placeholder"
+            )
+            chosen_bot = "placeholder"
+        else:
+            try:
+                system_prompt = load_dialog_prompt()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Не удалось загрузить system prompt")
+                logger.error("Проверьте SYSTEM_PROMPT_FILES и каталог prompts/: %s", exc)
+                return 2
+            dialog_factory = build_dialog_factory(
+                ai, store, system_prompt, dialog_config
+            )
+            chosen_bot = "ai"
+
     ui_server = None
     if args.ui:
-        store = TranscriptStore()
-        ai = None if args.no_asr else AiClient.from_env()
+        assert store is not None
         if ai is None:
             reason = (
                 "ASR отключён ключом --no-asr"
@@ -153,6 +246,14 @@ def cmd_incoming(settings: Settings, args: argparse.Namespace) -> int:
             )
             logger.warning(reason)
             store.publish(SYSTEM, reason)
+        elif dialog_factory is not None:
+            logger.info(
+                "AI-бот: ASR=%s, LLM=%s, TTS=%s/%s",
+                ai.asr_model,
+                ai.llm_model,
+                ai.tts_model,
+                ai.tts_voice,
+            )
         else:
             logger.info("ASR: модель=%s язык=%s", ai.asr_model, ai.asr_language)
         try:
@@ -166,10 +267,14 @@ def cmd_incoming(settings: Settings, args: argparse.Namespace) -> int:
             )
             return 2
 
-    def make_bot():
-        bot = build_bot(args.bot)
+    def make_bot() -> Optional[Bot]:
+        if dialog_factory is not None:
+            return dialog_factory()
+        bot = build_bot(chosen_bot)
         if store is not None:
-            return TranscribingBot(bot, store, ai)
+            # В режиме только-UI оставляем прежнюю схему: бот отвечает звуком,
+            # а распознавание идёт отдельной обёрткой.
+            return TranscribingBot(bot, store, ai, vad=dialog_config.make_vad())
         return bot
 
     phone = SipPhone(settings)
@@ -187,8 +292,10 @@ def cmd_incoming(settings: Settings, args: argparse.Namespace) -> int:
             raise SystemExit("Регистрация не удалась")
 
         logger.info(
-            "Многоканальный приём входящих: bot=%s max_lines=%d record_dir=%s",
-            args.bot,
+            "Многоканальный приём входящих: bot=%s (запрошен %s), "
+            "max_lines=%d record_dir=%s",
+            chosen_bot,
+            requested_bot,
             settings.max_incoming_lines,
             args.record_dir,
         )
@@ -293,8 +400,12 @@ def build_parser() -> argparse.ArgumentParser:
     incoming = sub.add_parser("incoming", help="многоканальный приём входящих звонков")
     incoming.add_argument(
         "--bot",
-        default="placeholder",
-        help="обработчик: silence|echo|tone|placeholder|placeholder:<мс>|wav:<путь>[:loop]",
+        default="auto",
+        help=(
+            "обработчик: auto|ai|silence|echo|tone|placeholder|"
+            "placeholder:<мс>|wav:<путь>[:loop]. auto выбирает ai, "
+            "если настроены ASR/LLM/TTS, иначе placeholder"
+        ),
     )
     incoming.add_argument(
         "--record-dir",
@@ -326,7 +437,7 @@ def build_parser() -> argparse.ArgumentParser:
     incoming.add_argument(
         "--no-asr",
         action="store_true",
-        help="не распознавать речь (UI покажет только события звонка)",
+        help="отключить ASR и AI-бота (UI покажет только события звонка)",
     )
     incoming.set_defaults(func=cmd_incoming)
 

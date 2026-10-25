@@ -95,12 +95,17 @@ class TranscribingBot:
         if self._delegate is not None:
             self._delegate.on_call_ended()
 
-    def close(self) -> None:
+    def close(self, grace: float = 1.0) -> None:
         self._closed.set()
         self._vad.close()
         if self._delegate is not None:
             self._delegate.close()
-        # Не ждём сетевой ASR: поток демон, приложение не должно зависать.
+        # Даём ASR короткий шанс дораспознать реплику, поставленную
+        # on_call_ended(). Поток демон, поэтому зависание приложения
+        # по-прежнему невозможно.
+        worker = self._worker
+        if worker is not None and worker.is_alive() and grace > 0:
+            worker.join(grace)
 
     # ------------------------------------------------------------------
     # ASR
@@ -126,8 +131,8 @@ class TranscribingBot:
                 if self._closed.is_set():
                     return
                 continue
-            if self._closed.is_set() and self._queue.empty():
-                return
+            # Важно: уже полученную реплику обрабатываем даже после close().
+            # Иначе последняя фраза при быстром отбое теряется.
             try:
                 assert self._ai is not None
                 text = self._ai.transcribe(

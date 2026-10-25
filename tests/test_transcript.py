@@ -86,6 +86,21 @@ def test_transcribing_bot_publishes_asr_text():
     assert any(m["role"] == SYSTEM for m in store.snapshot())
 
 
+def test_transcribing_bot_close_processes_final_utterance():
+    store = TranscriptStore()
+    ai = FakeAi("последняя фраза")
+    vad = EnergyVAD(speech_ms=20, silence_ms=20, max_utterance_ms=500)
+    bot = TranscribingBot(EchoBot(), store, ai, vad=vad, language="ru")
+    bot.on_call_started("1001", "call-fast-hangup")
+    bot.on_frame(tone_u8(440, 20, amplitude=0.5))
+    bot.on_call_ended()
+    bot.close(grace=1.0)
+
+    assert [m["text"] for m in store.snapshot() if m["role"] == CALLER] == [
+        "последняя фраза"
+    ]
+
+
 def test_transcribing_bot_without_ai_only_tracks_events():
     store = TranscriptStore()
     bot = TranscribingBot(None, store, None)
