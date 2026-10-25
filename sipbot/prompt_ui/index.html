@@ -1,0 +1,1451 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Редактор промптов</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #090d16;
+      --bg-soft: #0d1220;
+      --panel: rgba(17, 24, 40, 0.92);
+      --panel-strong: #141c2e;
+      --line: rgba(148, 163, 204, 0.16);
+      --line-strong: rgba(148, 163, 204, 0.28);
+      --text: #e9edf9;
+      --muted: #8f9bb9;
+      --muted-2: #6f7b99;
+      --accent: #7c8cff;
+      --accent-soft: rgba(124, 140, 255, 0.16);
+      --accent-2: #5eead4;
+      --ok: #4ade80;
+      --warn: #fbbf24;
+      --danger: #ff6b81;
+      --shadow: 0 22px 70px rgba(0, 0, 0, 0.34);
+      --radius: 18px;
+      --font: "Inter", "SF Pro Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+      --mono: "SFMono-Regular", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+
+    body {
+      margin: 0;
+      overflow: hidden;
+      color: var(--text);
+      font-family: var(--font);
+      background:
+        radial-gradient(900px 600px at 8% -10%, rgba(80, 96, 220, 0.24), transparent 60%),
+        radial-gradient(800px 600px at 105% 5%, rgba(20, 184, 166, 0.12), transparent 58%),
+        var(--bg);
+    }
+
+    button, input, textarea { font: inherit; }
+    button { color: inherit; }
+    code, kbd, pre { font-family: var(--mono); }
+
+    kbd {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 20px;
+      padding: 2px 5px;
+      border: 1px solid var(--line-strong);
+      border-bottom-width: 2px;
+      border-radius: 6px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.04);
+      font-size: 11px;
+      line-height: 1.2;
+    }
+
+    .app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      padding: 18px;
+      gap: 16px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      flex: 0 0 auto;
+      padding: 14px 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(180deg, rgba(22, 30, 50, 0.94), rgba(14, 20, 34, 0.94));
+      box-shadow: var(--shadow);
+    }
+
+    .brand { display: flex; align-items: center; gap: 13px; min-width: 0; }
+
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      flex: 0 0 auto;
+      border-radius: 13px;
+      color: #0b1020;
+      font-weight: 800;
+      font-size: 19px;
+      background: linear-gradient(135deg, #b6c0ff, #6ee7d8);
+      box-shadow: 0 8px 26px rgba(94, 234, 212, 0.2);
+    }
+
+    .brand-text { min-width: 0; }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 19px;
+      letter-spacing: -0.02em;
+      line-height: 1.2;
+    }
+
+    .brand p {
+      margin: 4px 0 0;
+      max-width: min(62vw, 760px);
+      overflow: hidden;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .top-actions { display: flex; align-items: center; gap: 9px; flex: 0 0 auto; }
+
+    .btn, .icon-btn, .tab {
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease,
+                  transform 0.15s ease, opacity 0.15s ease;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      min-height: 38px;
+      padding: 8px 14px;
+      border-radius: 11px;
+      font-size: 13px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+
+    .btn:hover:not(:disabled) { transform: translateY(-1px); }
+    .btn:disabled { cursor: default; opacity: 0.42; }
+
+    .btn--primary {
+      border-color: rgba(124, 140, 255, 0.5);
+      color: #fff;
+      background: linear-gradient(135deg, #6c7bff, #5364ef);
+      box-shadow: 0 8px 24px rgba(83, 100, 239, 0.25);
+    }
+
+    .btn--primary:hover:not(:disabled) {
+      background: linear-gradient(135deg, #7b89ff, #5d6ef7);
+    }
+
+    .btn--ghost {
+      border-color: var(--line);
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.035);
+    }
+
+    .btn--ghost:hover:not(:disabled) {
+      border-color: var(--line-strong);
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.065);
+    }
+
+    .btn kbd { color: rgba(255, 255, 255, 0.7); border-color: rgba(255, 255, 255, 0.22); }
+
+    .save-state {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .save-state::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+      box-shadow: 0 0 10px currentColor;
+    }
+
+    .save-state--saved { color: var(--ok); background: rgba(74, 222, 128, 0.09); }
+    .save-state--dirty { color: var(--warn); background: rgba(251, 191, 36, 0.09); }
+    .save-state--saving { color: var(--accent); background: var(--accent-soft); }
+    .save-state--error { color: var(--danger); background: rgba(255, 107, 129, 0.1); }
+    .workspace {
+      display: grid;
+      grid-template-columns: 286px minmax(0, 1fr);
+      gap: 16px;
+      min-height: 0;
+      flex: 1 1 auto;
+    }
+
+    .sidebar, .editor-panel {
+      min-height: 0;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      padding: 15px 12px 12px;
+    }
+
+    .sidebar-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 0 4px;
+    }
+
+    .eyebrow {
+      display: block;
+      color: var(--muted-2);
+      font-size: 10px;
+      font-weight: 750;
+      letter-spacing: 0.13em;
+      text-transform: uppercase;
+    }
+
+    .sidebar h2 {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin: 3px 0 0;
+      font-size: 17px;
+      letter-spacing: -0.02em;
+    }
+
+    .count {
+      display: inline-grid;
+      place-items: center;
+      min-width: 21px;
+      height: 20px;
+      padding: 0 6px;
+      border-radius: 999px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.06);
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .icon-btn {
+      display: grid;
+      place-items: center;
+      width: 32px;
+      height: 32px;
+      flex: 0 0 auto;
+      border-color: var(--line);
+      border-radius: 10px;
+      color: var(--accent-2);
+      background: rgba(94, 234, 212, 0.07);
+      font-size: 21px;
+      line-height: 1;
+    }
+
+    .icon-btn:hover {
+      border-color: rgba(94, 234, 212, 0.4);
+      background: rgba(94, 234, 212, 0.13);
+      transform: translateY(-1px);
+    }
+
+    .search {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 14px 4px 9px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      color: var(--muted-2);
+      background: rgba(6, 10, 20, 0.4);
+    }
+
+    .search:focus-within {
+      border-color: rgba(124, 140, 255, 0.5);
+      box-shadow: 0 0 0 3px rgba(124, 140, 255, 0.1);
+    }
+
+    .search input {
+      width: 100%;
+      min-width: 0;
+      border: 0;
+      outline: 0;
+      color: var(--text);
+      background: transparent;
+      font-size: 12.5px;
+    }
+
+    .search input::placeholder { color: var(--muted-2); }
+
+    .prompt-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 2px 2px 8px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--line-strong) transparent;
+    }
+
+    .prompt-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      padding: 9px 10px;
+      border: 1px solid transparent;
+      border-radius: 11px;
+      color: var(--muted);
+      background: transparent;
+      text-align: left;
+    }
+
+    .prompt-item:hover {
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.045);
+    }
+
+    .prompt-item.is-active {
+      border-color: rgba(124, 140, 255, 0.34);
+      color: var(--text);
+      background: linear-gradient(135deg, rgba(124, 140, 255, 0.16), rgba(94, 234, 212, 0.05));
+    }
+
+    .prompt-icon {
+      display: grid;
+      place-items: center;
+      width: 28px;
+      height: 30px;
+      flex: 0 0 auto;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      color: var(--accent-2);
+      background: rgba(94, 234, 212, 0.06);
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .prompt-text { min-width: 0; flex: 1 1 auto; }
+
+    .prompt-name {
+      display: block;
+      overflow: hidden;
+      font-size: 12.5px;
+      font-weight: 620;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .prompt-sub {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted-2);
+      font-family: var(--mono);
+      font-size: 10px;
+    }
+
+    .prompt-empty {
+      padding: 22px 12px;
+      color: var(--muted-2);
+      font-size: 12px;
+      line-height: 1.6;
+      text-align: center;
+    }
+
+    .sidebar-foot {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-top: auto;
+      padding: 11px 5px 2px;
+      border-top: 1px solid var(--line);
+      color: var(--muted-2);
+      font-size: 10.5px;
+      line-height: 1.4;
+    }
+
+    .sidebar-foot code { color: var(--muted); font-size: 10px; }
+
+    .dot {
+      width: 6px;
+      height: 6px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: var(--accent-2);
+      box-shadow: 0 0 8px var(--accent-2);
+    }
+    .editor-panel {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .filebar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      flex: 0 0 auto;
+      min-height: 70px;
+      padding: 12px 18px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent);
+    }
+
+    .file-title { min-width: 0; }
+
+    .file-name {
+      overflow: hidden;
+      font-family: var(--mono);
+      font-size: 14px;
+      font-weight: 650;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .file-meta {
+      margin-top: 4px;
+      overflow: hidden;
+      color: var(--muted-2);
+      font-size: 11px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .view-tabs {
+      display: flex;
+      gap: 3px;
+      flex: 0 0 auto;
+      padding: 3px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: rgba(6, 10, 20, 0.42);
+    }
+
+    .tab {
+      padding: 7px 12px;
+      border-radius: 8px;
+      color: var(--muted-2);
+      background: transparent;
+      font-size: 12px;
+      font-weight: 620;
+    }
+
+    .tab:hover { color: var(--text); }
+
+    .tab--active {
+      color: var(--text);
+      background: rgba(124, 140, 255, 0.18);
+      box-shadow: inset 0 0 0 1px rgba(124, 140, 255, 0.22);
+    }
+
+    .editor-body {
+      position: relative;
+      min-height: 0;
+      flex: 1 1 auto;
+      background:
+        linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+        linear-gradient(rgba(255, 255, 255, 0.012) 1px, transparent 1px);
+      background-size: 48px 48px;
+    }
+
+    .code-wrap {
+      display: flex;
+      height: 100%;
+      min-height: 0;
+    }
+
+    .line-numbers {
+      width: 55px;
+      flex: 0 0 auto;
+      margin: 0;
+      padding: 24px 10px 24px 0;
+      overflow: hidden;
+      border-right: 1px solid var(--line);
+      color: #4e5a78;
+      background: rgba(5, 9, 17, 0.45);
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.75;
+      text-align: right;
+      user-select: none;
+    }
+
+    #editor {
+      width: 100%;
+      min-width: 0;
+      height: 100%;
+      margin: 0;
+      padding: 24px 30px;
+      border: 0;
+      outline: 0;
+      resize: none;
+      color: #dbe2f5;
+      background: transparent;
+      font-family: var(--mono);
+      font-size: 13.5px;
+      line-height: 1.75;
+      tab-size: 4;
+      white-space: pre;
+      overflow: auto;
+      caret-color: var(--accent-2);
+      scrollbar-width: thin;
+      scrollbar-color: var(--line-strong) transparent;
+    }
+
+    #editor::placeholder { color: var(--muted-2); }
+    #editor::selection { background: rgba(124, 140, 255, 0.3); }
+
+    .statusbar {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      flex: 0 0 auto;
+      min-height: 36px;
+      padding: 7px 18px;
+      border-top: 1px solid var(--line);
+      color: var(--muted-2);
+      background: rgba(5, 9, 17, 0.35);
+      font-family: var(--mono);
+      font-size: 10.5px;
+    }
+
+    .statusbar-hint { margin-left: auto; }
+
+    .welcome {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      padding: 30px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .welcome-mark {
+      display: grid;
+      place-items: center;
+      width: 62px;
+      height: 62px;
+      margin-bottom: 16px;
+      border: 1px solid rgba(124, 140, 255, 0.32);
+      border-radius: 20px;
+      color: var(--accent);
+      background: radial-gradient(circle at 30% 20%, rgba(124, 140, 255, 0.25), rgba(124, 140, 255, 0.04));
+      font-size: 28px;
+    }
+
+    .welcome h2 { margin: 0 0 8px; color: var(--text); font-size: 21px; }
+
+    .welcome p {
+      max-width: 460px;
+      margin: 0 0 20px;
+      font-size: 13px;
+      line-height: 1.65;
+    }
+
+    .welcome code { color: var(--accent-2); }
+    .preview {
+      height: 100%;
+      overflow: auto;
+      padding: 32px clamp(24px, 5vw, 70px) 80px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--line-strong) transparent;
+    }
+
+    .markdown {
+      max-width: 880px;
+      margin: 0 auto;
+      color: #dce3f4;
+      font-size: 14px;
+      line-height: 1.75;
+    }
+
+    .markdown h1, .markdown h2, .markdown h3,
+    .markdown h4, .markdown h5, .markdown h6 {
+      margin: 1.5em 0 0.55em;
+      color: #f4f6ff;
+      line-height: 1.28;
+      letter-spacing: -0.02em;
+    }
+
+    .markdown h1:first-child, .markdown h2:first-child, .markdown h3:first-child {
+      margin-top: 0;
+    }
+
+    .markdown h1 { font-size: 28px; }
+
+    .markdown h2 {
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--line);
+      font-size: 21px;
+    }
+
+    .markdown h3 { font-size: 17px; }
+    .markdown h4, .markdown h5, .markdown h6 { font-size: 14px; }
+    .markdown p { margin: 0 0 1em; }
+    .markdown strong { color: #fff; }
+    .markdown em { color: #c9d2ea; }
+    .markdown a { color: var(--accent-2); text-decoration: none; }
+    .markdown a:hover { text-decoration: underline; }
+
+    .markdown ul, .markdown ol {
+      margin: 0 0 1em;
+      padding-left: 1.6em;
+    }
+
+    .markdown li { margin: 0.3em 0; }
+    .markdown li::marker { color: var(--accent); }
+
+    .markdown blockquote {
+      margin: 0 0 1em;
+      padding: 0.6em 1em;
+      border-left: 3px solid var(--accent);
+      border-radius: 0 8px 8px 0;
+      color: #c4cde4;
+      background: rgba(124, 140, 255, 0.08);
+    }
+
+    .markdown blockquote p { margin: 0; }
+
+    .markdown code {
+      padding: 2px 6px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: #9de9dd;
+      background: rgba(5, 9, 17, 0.65);
+      font-size: 0.9em;
+    }
+
+    .markdown pre {
+      overflow-x: auto;
+      margin: 0 0 1.2em;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(5, 9, 17, 0.7);
+      line-height: 1.6;
+    }
+
+    .markdown pre code {
+      padding: 0;
+      border: 0;
+      background: none;
+      font-size: 12.5px;
+    }
+
+    .markdown hr {
+      margin: 1.8em 0;
+      border: 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .markdown-empty {
+      display: grid;
+      place-items: center;
+      min-height: 240px;
+      color: var(--muted-2);
+      font-size: 13px;
+    }
+
+    .toast {
+      position: fixed;
+      right: 26px;
+      bottom: 26px;
+      z-index: 50;
+      max-width: min(440px, calc(100vw - 52px));
+      padding: 11px 15px;
+      border: 1px solid var(--line-strong);
+      border-radius: 12px;
+      color: var(--text);
+      background: rgba(20, 28, 46, 0.98);
+      box-shadow: 0 16px 46px rgba(0, 0, 0, 0.4);
+      font-size: 12.5px;
+      line-height: 1.45;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(10px);
+      transition: opacity 0.18s ease, transform 0.18s ease;
+    }
+
+    .toast.is-visible { opacity: 1; transform: translateY(0); }
+    .toast--error { border-color: rgba(255, 107, 129, 0.45); }
+    .toast--ok { border-color: rgba(74, 222, 128, 0.4); }
+    .modal {
+      position: fixed;
+      inset: 0;
+      z-index: 40;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+      background: rgba(4, 7, 13, 0.7);
+      backdrop-filter: blur(5px);
+    }
+
+    .modal[hidden] { display: none; }
+
+    .modal-card {
+      width: min(430px, 100%);
+      padding: 24px;
+      border: 1px solid var(--line-strong);
+      border-radius: 18px;
+      background: linear-gradient(180deg, #182136, #111827);
+      box-shadow: 0 30px 90px rgba(0, 0, 0, 0.55);
+    }
+
+    .modal-card h2 { margin: 4px 0 20px; font-size: 21px; }
+
+    .field { display: block; }
+    .field span { display: block; margin-bottom: 7px; color: var(--muted); font-size: 12px; }
+
+    .field input {
+      width: 100%;
+      padding: 11px 12px;
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      outline: 0;
+      color: var(--text);
+      background: rgba(5, 9, 17, 0.5);
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+
+    .field input:focus {
+      border-color: rgba(124, 140, 255, 0.65);
+      box-shadow: 0 0 0 3px rgba(124, 140, 255, 0.13);
+    }
+
+    .hint { margin: 9px 0 0; color: var(--muted-2); font-size: 11px; }
+    .hint code { color: var(--accent-2); }
+
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 9px;
+      margin-top: 24px;
+    }
+
+    @media (max-width: 900px) {
+      .app { padding: 10px; gap: 10px; }
+      .workspace { grid-template-columns: 230px minmax(0, 1fr); gap: 10px; }
+      .topbar { padding: 11px 13px; }
+      .brand p { max-width: 44vw; }
+      .save-state { display: none; }
+      .filebar { padding: 10px 13px; }
+      #editor { padding: 20px; }
+      .line-numbers { width: 46px; padding-right: 8px; }
+      .preview { padding: 24px; }
+    }
+
+    @media (max-width: 680px) {
+      body { overflow: auto; }
+      .app { height: auto; min-height: 100vh; }
+      .topbar { align-items: flex-start; }
+      .brand p { display: none; }
+      .top-actions .btn--ghost { display: none; }
+      .workspace { grid-template-columns: 1fr; grid-template-rows: auto minmax(520px, 1fr); }
+      .sidebar { max-height: 245px; }
+      .statusbar-hint { display: none; }
+      .filebar { align-items: flex-start; gap: 10px; }
+    }
+
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">P</div>
+        <div class="brand-text">
+          <h1>Редактор промптов</h1>
+          <p id="rootPath" title="">Загрузка каталога…</p>
+        </div>
+      </div>
+      <div class="top-actions">
+        <span id="saveState" class="save-state save-state--saved">Сохранено</span>
+        <button id="reloadButton" class="btn btn--ghost" type="button" disabled>
+          Перечитать
+        </button>
+        <button id="saveButton" class="btn btn--primary" type="button" disabled>
+          Сохранить <kbd>⌘S</kbd>
+        </button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <div>
+            <span class="eyebrow">Prompts</span>
+            <h2>Файлы <span id="promptCount" class="count">0</span></h2>
+          </div>
+          <button id="newButton" class="icon-btn" type="button" title="Новый промпт">
+            +
+          </button>
+        </div>
+        <label class="search">
+          <span aria-hidden="true">⌕</span>
+          <input id="searchInput" type="search" placeholder="Поиск по имени" autocomplete="off">
+        </label>
+        <nav id="promptList" class="prompt-list" aria-label="Список промптов"></nav>
+        <div class="sidebar-foot">
+          <span class="dot"></span>
+          Поддерживаются <code>.md</code>, <code>.txt</code>, <code>.prompt</code>
+        </div>
+      </aside>
+
+      <section class="editor-panel">
+        <div class="filebar">
+          <div class="file-title">
+            <div id="fileName" class="file-name">Промпт не выбран</div>
+            <div id="fileMeta" class="file-meta">Выберите файл слева</div>
+          </div>
+          <div class="view-tabs" role="tablist" aria-label="Режим просмотра">
+            <button id="editTab" class="tab tab--active" type="button" role="tab"
+                    aria-selected="true" data-view="editor">Редактор</button>
+            <button id="previewTab" class="tab" type="button" role="tab"
+                    aria-selected="false" data-view="preview">Чтение</button>
+          </div>
+        </div>
+
+        <div class="editor-body">
+          <div id="codeWrap" class="code-wrap" hidden>
+            <pre id="lineNumbers" class="line-numbers" aria-hidden="true">1</pre>
+            <textarea id="editor" spellcheck="false" wrap="off"
+                      placeholder="Текст промпта…"></textarea>
+          </div>
+          <article id="preview" class="preview markdown" hidden></article>
+          <div id="welcome" class="welcome">
+            <div class="welcome-mark" aria-hidden="true">✎</div>
+            <h2>Выберите промпт</h2>
+            <p>Слева появится список файлов из каталога <code>prompts</code>.
+               Можно открыть существующий промпт или создать новый.</p>
+            <button id="welcomeNew" class="btn btn--primary" type="button">
+              Создать промпт
+            </button>
+          </div>
+        </div>
+
+        <footer class="statusbar">
+          <span id="caretInfo">Стр 1, кол. 1</span>
+          <span id="charInfo">0 символов · 0 строк</span>
+          <span class="statusbar-hint">
+            <kbd>Ctrl</kbd>/<kbd>⌘</kbd> + <kbd>S</kbd> — сохранить
+          </span>
+        </footer>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <div id="newModal" class="modal" hidden>
+    <form id="newForm" class="modal-card">
+      <span class="eyebrow">Новый файл</span>
+      <h2>Создать промпт</h2>
+      <label class="field">
+        <span>Имя файла</span>
+        <input id="newName" type="text" placeholder="support_new.md"
+               autocomplete="off" maxlength="120" required>
+      </label>
+      <p class="hint">Если расширение не указано, добавится <code>.md</code>.</p>
+      <div class="modal-actions">
+        <button id="newCancel" class="btn btn--ghost" type="button">Отмена</button>
+        <button class="btn btn--primary" type="submit">Создать</button>
+      </div>
+    </form>
+  </div>
+
+  <script>
+    "use strict";
+
+    const $ = (id) => document.getElementById(id);
+    const dom = {
+      rootPath: $("rootPath"),
+      saveState: $("saveState"),
+      saveButton: $("saveButton"),
+      reloadButton: $("reloadButton"),
+      promptCount: $("promptCount"),
+      promptList: $("promptList"),
+      searchInput: $("searchInput"),
+      newButton: $("newButton"),
+      welcomeNew: $("welcomeNew"),
+      fileName: $("fileName"),
+      fileMeta: $("fileMeta"),
+      editTab: $("editTab"),
+      previewTab: $("previewTab"),
+      codeWrap: $("codeWrap"),
+      lineNumbers: $("lineNumbers"),
+      editor: $("editor"),
+      preview: $("preview"),
+      welcome: $("welcome"),
+      caretInfo: $("caretInfo"),
+      charInfo: $("charInfo"),
+      toast: $("toast"),
+      newModal: $("newModal"),
+      newForm: $("newForm"),
+      newName: $("newName"),
+      newCancel: $("newCancel"),
+    };
+
+    const SUPPORTED = /\.(md|txt|prompt)$/i;
+    const state = {
+      prompts: [],
+      active: null,
+      savedContent: "",
+      dirty: false,
+      view: "editor",
+      saving: false,
+      toastTimer: null,
+    };
+
+    function formatBytes(bytes) {
+      if (bytes < 1024) return `${bytes} Б`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} КБ`;
+      return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
+    }
+
+    function formatDate(seconds) {
+      if (!seconds) return "";
+      try {
+        return new Intl.DateTimeFormat("ru-RU", {
+          day: "2-digit",
+          month: "short",
+          hour: "2-digit",
+          minute: "2-digit",
+        }).format(new Date(seconds * 1000));
+      } catch (_error) {
+        return "";
+      }
+    }
+
+    async function api(url, options = {}) {
+      const request = { ...options, headers: { Accept: "application/json", ...(options.headers || {}) } };
+      if (request.body && typeof request.body !== "string") {
+        request.headers["Content-Type"] = "application/json";
+        request.body = JSON.stringify(request.body);
+      }
+      const response = await fetch(url, request);
+      let data = null;
+      try {
+        data = await response.json();
+      } catch (_error) {
+        data = null;
+      }
+      if (!response.ok) {
+        const error = new Error((data && data.error) || `Ошибка ${response.status}`);
+        error.status = response.status;
+        error.data = data;
+        throw error;
+      }
+      return data;
+    }
+
+    function showToast(message, kind = "info") {
+      clearTimeout(state.toastTimer);
+      dom.toast.textContent = message;
+      dom.toast.className = `toast toast--${kind} is-visible`;
+      state.toastTimer = setTimeout(() => {
+        dom.toast.classList.remove("is-visible");
+      }, 3200);
+    }
+
+    function confirmDiscard() {
+      return !state.dirty || window.confirm(
+        "Есть несохранённые изменения. Продолжить без сохранения?"
+      );
+    }
+
+    function openNewDialog() {
+      if (!confirmDiscard()) return;
+      dom.newName.value = "";
+      dom.newModal.hidden = false;
+      setTimeout(() => dom.newName.focus(), 0);
+    }
+
+    function closeNewDialog() {
+      dom.newModal.hidden = true;
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      }[ch]));
+    }
+
+    function inlineMarkdown(text) {
+      let out = escapeHtml(text);
+      out = out.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+      out = out.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+      out = out.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+      out = out.replace(
+        /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+|mailto:[^)]+)\)/g,
+        '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
+      );
+      return out;
+    }
+
+    function renderMarkdown(source) {
+      const lines = String(source || "").replace(/\r\n?/g, "\n").split("\n");
+      const out = [];
+      let paragraph = [];
+      let quote = [];
+      let code = [];
+      let inCode = false;
+      let listType = null;
+      let listItems = [];
+
+      const flushParagraph = () => {
+        if (paragraph.length) {
+          out.push(`<p>${paragraph.map(inlineMarkdown).join("<br>")}</p>`);
+          paragraph = [];
+        }
+      };
+      const flushQuote = () => {
+        if (quote.length) {
+          out.push(`<blockquote><p>${quote.map(inlineMarkdown).join("<br>")}</p></blockquote>`);
+          quote = [];
+        }
+      };
+      const flushCode = () => {
+        out.push(`<pre><code>${escapeHtml(code.join("\n"))}</code></pre>`);
+        code = [];
+      };
+      const flushList = () => {
+        if (listItems.length) {
+          out.push(`<${listType}>${listItems.map((item) => `<li>${item}</li>`).join("")}</${listType}>`);
+          listItems = [];
+          listType = null;
+        }
+      };
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+
+        if (listType && line.startsWith("  ") && line.trim()) {
+          listItems[listItems.length - 1] += " " + inlineMarkdown(line.trim());
+          continue;
+        }
+
+        if (inCode) {
+          if (/^```/.test(trimmed)) {
+            flushCode();
+            inCode = false;
+          } else {
+            code.push(line);
+          }
+          continue;
+        }
+
+        if (/^```/.test(trimmed)) {
+          flushParagraph();
+          flushList();
+          flushQuote();
+          inCode = true;
+          continue;
+        }
+
+        if (!trimmed) {
+          flushParagraph();
+          flushList();
+          flushQuote();
+          continue;
+        }
+
+        let match = line.match(/^(#{1,6})\s+(.*)$/);
+        if (match) {
+          flushParagraph();
+          flushList();
+          flushQuote();
+          const level = match[1].length;
+          out.push(`<h${level}>${inlineMarkdown(match[2])}</h${level}>`);
+          continue;
+        }
+
+        if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+          flushParagraph();
+          flushList();
+          flushQuote();
+          out.push("<hr>");
+          continue;
+        }
+
+        if ((match = line.match(/^>\s?(.*)$/))) {
+          flushParagraph();
+          flushList();
+          quote.push(match[1]);
+          continue;
+        }
+        flushQuote();
+
+        if ((match = line.match(/^\s*([-*+]|\d+\.)\s+(.*)$/))) {
+          flushParagraph();
+          const nextType = /\d/.test(match[1]) ? "ol" : "ul";
+          if (listType && listType !== nextType) flushList();
+          listType = nextType;
+          listItems.push(inlineMarkdown(match[2]));
+          continue;
+        }
+        flushList();
+        paragraph.push(trimmed);
+      }
+
+      if (inCode) flushCode();
+      flushList();
+      flushParagraph();
+      flushQuote();
+      if (!out.length) {
+        return '<div class="markdown-empty">Промпт пока пуст</div>';
+      }
+      return out.join("\n");
+    }
+
+    function setStatus(kind, text) {
+      dom.saveState.className = `save-state save-state--${kind}`;
+      dom.saveState.textContent = text;
+    }
+
+    function updateLineNumbers() {
+      const count = Math.max(1, dom.editor.value.split("\n").length);
+      if (dom.lineNumbers.dataset.count !== String(count)) {
+        const numbers = [];
+        for (let index = 1; index <= count; index += 1) numbers.push(index);
+        dom.lineNumbers.textContent = numbers.join("\n");
+        dom.lineNumbers.dataset.count = String(count);
+      }
+      dom.lineNumbers.scrollTop = dom.editor.scrollTop;
+    }
+
+    function updateCaret() {
+      const upto = dom.editor.value.slice(0, dom.editor.selectionStart || 0);
+      const line = upto.split("\n").length;
+      const column = upto.length - upto.lastIndexOf("\n");
+      dom.caretInfo.textContent = `Стр ${line}, кол. ${column}`;
+    }
+
+    function updateTextStats() {
+      const text = dom.editor.value;
+      const chars = text.length;
+      const lines = text ? text.split("\n").length : 0;
+      dom.charInfo.textContent = `${chars} символов · ${lines} строк`;
+    }
+
+    function renderPromptList() {
+      const query = dom.searchInput.value.trim().toLocaleLowerCase("ru");
+      const visible = state.prompts.filter(
+        (item) => item.name.toLocaleLowerCase("ru").includes(query)
+      );
+      dom.promptCount.textContent = String(state.prompts.length);
+      dom.promptList.replaceChildren();
+
+      if (!visible.length) {
+        const empty = document.createElement("div");
+        empty.className = "prompt-empty";
+        empty.textContent = state.prompts.length
+          ? "Ничего не найдено"
+          : "В каталоге пока нет промптов";
+        dom.promptList.appendChild(empty);
+        return;
+      }
+
+      for (const item of visible) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "prompt-item";
+        button.dataset.name = item.name;
+        if (state.active && state.active.name === item.name) {
+          button.classList.add("is-active");
+        }
+
+        const icon = document.createElement("span");
+        icon.className = "prompt-icon";
+        icon.textContent = (item.name.split(".").pop() || "md").slice(0, 4);
+
+        const text = document.createElement("span");
+        text.className = "prompt-text";
+        const name = document.createElement("span");
+        name.className = "prompt-name";
+        name.textContent = item.name;
+        const sub = document.createElement("span");
+        sub.className = "prompt-sub";
+        sub.textContent = `${formatBytes(item.size)} · ${formatDate(item.modified_at)}`;
+        text.append(name, sub);
+        button.append(icon, text);
+        dom.promptList.appendChild(button);
+      }
+    }
+
+    function renderPreview() {
+      if (!state.active) return;
+      dom.preview.innerHTML = renderMarkdown(dom.editor.value);
+    }
+    function updateUi() {
+      const active = state.active;
+      const hasActive = Boolean(active);
+      dom.welcome.hidden = hasActive;
+      dom.codeWrap.hidden = !hasActive || state.view !== "editor";
+      dom.preview.hidden = !hasActive || state.view !== "preview";
+      dom.editTab.disabled = !hasActive;
+      dom.previewTab.disabled = !hasActive;
+      dom.saveButton.disabled = !hasActive || !state.dirty || state.saving;
+      dom.reloadButton.disabled = !hasActive || state.saving;
+
+      dom.editTab.classList.toggle("tab--active", state.view === "editor");
+      dom.previewTab.classList.toggle("tab--active", state.view === "preview");
+      dom.editTab.setAttribute("aria-selected", String(state.view === "editor"));
+      dom.previewTab.setAttribute("aria-selected", String(state.view === "preview"));
+
+      if (active) {
+        dom.fileName.textContent = active.name;
+        dom.fileMeta.textContent =
+          `${formatBytes(new Blob([dom.editor.value]).size)} · изменён ${formatDate(active.modified_at)}`;
+      } else {
+        dom.fileName.textContent = "Промпт не выбран";
+        dom.fileMeta.textContent = "Выберите файл слева";
+      }
+
+      updateTextStats();
+      updateLineNumbers();
+      updateCaret();
+      document.title = active
+        ? `${state.dirty ? "● " : ""}${active.name} — редактор промптов`
+        : "Редактор промптов";
+    }
+
+    function setActive(documentData) {
+      state.active = documentData;
+      state.savedContent = documentData.content;
+      state.dirty = false;
+      dom.editor.value = documentData.content;
+      setStatus("saved", "Сохранено");
+      renderPromptList();
+      if (state.view === "preview") renderPreview();
+      updateUi();
+    }
+
+    function setView(view) {
+      state.view = view;
+      if (view === "preview") renderPreview();
+      updateUi();
+    }
+
+    async function selectPrompt(name, force = false) {
+      if (!name) return;
+      if (!force && !confirmDiscard()) return;
+      try {
+        const documentData = await api(`/api/prompts/${encodeURIComponent(name)}`);
+        setActive(documentData);
+        setView("editor");
+        dom.editor.focus();
+      } catch (error) {
+        showToast(`Не удалось открыть ${name}: ${error.message}`, "error");
+      }
+    }
+
+    async function refreshList(autoSelect = false) {
+      try {
+        const data = await api("/api/prompts");
+        state.prompts = data.prompts || [];
+        dom.rootPath.textContent = data.root;
+        dom.rootPath.title = data.root;
+        if (state.active && !state.prompts.some((item) => item.name === state.active.name)) {
+          state.active = null;
+          state.savedContent = "";
+          state.dirty = false;
+          dom.editor.value = "";
+          setStatus("saved", "Сохранено");
+        }
+        renderPromptList();
+        updateUi();
+        if (autoSelect && !state.active && state.prompts.length) {
+          await selectPrompt(state.prompts[0].name, true);
+        }
+      } catch (error) {
+        dom.rootPath.textContent = "Нет связи с сервером";
+        showToast(`Не удалось загрузить список: ${error.message}`, "error");
+      }
+    }
+    function onEditorInput() {
+      state.dirty = dom.editor.value !== state.savedContent;
+      if (!state.saving) {
+        setStatus(state.dirty ? "dirty" : "saved", state.dirty ? "Не сохранено" : "Сохранено");
+      }
+      if (state.view === "preview") renderPreview();
+      updateUi();
+    }
+
+    async function savePrompt() {
+      if (!state.active || state.saving || !state.dirty) return;
+      const name = state.active.name;
+      const content = dom.editor.value;
+      state.saving = true;
+      setStatus("saving", "Сохранение…");
+      updateUi();
+      let force = false;
+      try {
+        let documentData = null;
+        while (documentData === null) {
+          try {
+            documentData = await api(`/api/prompts/${encodeURIComponent(name)}`, {
+              method: "PUT",
+              body: {
+                content,
+                base_mtime_ns: state.active.modified_ns,
+                force,
+              },
+            });
+          } catch (error) {
+            if (error.status === 409 && !force) {
+              const overwrite = window.confirm(
+                `${error.message}\n\nПерезаписать файл текущей версией из редактора?`
+              );
+              if (!overwrite) {
+                setStatus("error", "Конфликт версий");
+                showToast("Сохранение отменено: файл изменён на диске", "error");
+                return;
+              }
+              force = true;
+              continue;
+            }
+            throw error;
+          }
+        }
+        const view = state.view;
+        setActive(documentData);
+        setView(view);
+        setStatus("saved", "Сохранено");
+        showToast(`Сохранено: ${name}`, "ok");
+        await refreshList();
+      } catch (error) {
+        setStatus("error", "Ошибка сохранения");
+        showToast(`Не удалось сохранить: ${error.message}`, "error");
+      } finally {
+        state.saving = false;
+        updateUi();
+      }
+    }
+
+    async function reloadPrompt() {
+      if (!state.active || state.saving) return;
+      if (!confirmDiscard()) return;
+      const name = state.active.name;
+      const view = state.view;
+      try {
+        const documentData = await api(`/api/prompts/${encodeURIComponent(name)}`);
+        setActive(documentData);
+        setView(view);
+        showToast(`Перечитано с диска: ${name}`, "ok");
+      } catch (error) {
+        showToast(`Не удалось перечитать ${name}: ${error.message}`, "error");
+      }
+    }
+
+    async function createPrompt(event) {
+      event.preventDefault();
+      let name = dom.newName.value.trim();
+      if (!name) return;
+      if (!SUPPORTED.test(name)) name += ".md";
+      try {
+        const documentData = await api("/api/prompts", {
+          method: "POST",
+          body: { name, content: "" },
+        });
+        closeNewDialog();
+        await refreshList();
+        await selectPrompt(documentData.name, true);
+        setView("editor");
+        dom.editor.focus();
+        showToast(`Создан промпт: ${documentData.name}`, "ok");
+      } catch (error) {
+        showToast(`Не удалось создать файл: ${error.message}`, "error");
+      }
+    }
+    dom.editor.addEventListener("input", onEditorInput);
+    dom.editor.addEventListener("scroll", updateLineNumbers);
+    dom.editor.addEventListener("keyup", updateCaret);
+    dom.editor.addEventListener("click", updateCaret);
+    dom.editor.addEventListener("select", updateCaret);
+    dom.editor.addEventListener("keydown", (event) => {
+      if (event.key !== "Tab" || event.ctrlKey || event.metaKey || event.altKey) return;
+      event.preventDefault();
+      const start = dom.editor.selectionStart;
+      const end = dom.editor.selectionEnd;
+      dom.editor.setRangeText("  ", start, end, "end");
+      onEditorInput();
+      updateCaret();
+    });
+
+    dom.promptList.addEventListener("click", (event) => {
+      const button = event.target.closest(".prompt-item");
+      if (button && button.dataset.name) selectPrompt(button.dataset.name);
+    });
+
+    dom.searchInput.addEventListener("input", renderPromptList);
+    dom.editTab.addEventListener("click", () => setView("editor"));
+    dom.previewTab.addEventListener("click", () => setView("preview"));
+    dom.saveButton.addEventListener("click", savePrompt);
+    dom.reloadButton.addEventListener("click", reloadPrompt);
+    dom.newButton.addEventListener("click", openNewDialog);
+    dom.welcomeNew.addEventListener("click", openNewDialog);
+    dom.newCancel.addEventListener("click", closeNewDialog);
+    dom.newForm.addEventListener("submit", createPrompt);
+    dom.newModal.addEventListener("click", (event) => {
+      if (event.target === dom.newModal) closeNewDialog();
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        savePrompt();
+      }
+      if (event.key === "Escape" && !dom.newModal.hidden) {
+        closeNewDialog();
+      }
+    });
+
+    window.addEventListener("beforeunload", (event) => {
+      if (!state.dirty) return;
+      event.preventDefault();
+      event.returnValue = "";
+    });
+    (async function init() {
+      await refreshList(true);
+      updateUi();
+    })();
+
+  </script>
+</body>
+</html>
