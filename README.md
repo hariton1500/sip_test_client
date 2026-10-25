@@ -98,6 +98,40 @@ python scripts/prompt_editor.py
 Не открывайте его в интернет. Для правки промптов достаточно прав на запись
 в каталог `prompts/`; содержимое сохраняется в UTF-8.
 
+## Промпты для LLM
+
+`PromptStore` умеет собирать несколько файлов в один system prompt. По
+умолчанию берутся все файлы предметной области в фиксированном порядке:
+
+```text
+support_evp.md → connection_terms.md → billing_account_data.md → internet_private.md
+```
+
+Порядок можно переопределить в `SYSTEM_PROMPT_FILES` (запятая, точка с
+запятой или перевод строки). Например:
+
+```ini
+SYSTEM_PROMPT_FILES=support_evp.md,connection_terms.md,billing_account_data.md,internet_private.md
+```
+
+Пути вида `prompts/support_evp.md` и `prompts\support_evp.md` приводятся к
+имени файла; дубликаты удаляются с сохранением первого вхождения. Если файл
+не найден, загрузка падает с `PromptNotFound`, а не отдаёт LLM неполный
+промпт. Части разделяются строкой `\n\n---\n\n`.
+
+Сборка в коде:
+
+```python
+from sipbot.prompts import PromptStore
+
+store = PromptStore("prompts")
+bundle = store.load_system_prompt_from_env()  # SYSTEM_PROMPT_FILES
+system_prompt = bundle.content
+```
+
+`SYSTEM_PROMPT_FILE` поддерживается как устаревший одиночный вариант: он
+используется, только если `SYSTEM_PROMPT_FILES` не задан или пуст.
+
 ## Ограничения pyVoIP 1.6.8 (важно!)
 
 * только **G.711 (PCMU/PCMA), 8 кГц, моно** — без Opus/G.722;
@@ -210,6 +244,8 @@ AI_TIMEOUT=30
 | `TTS_MODEL` / `OPENAI_TTS_MODEL` | `gemini-3.8-flash-lite-tts` | модель TTS |
 | `TTS_VOICE` / `OPENAI_TTS_VOICE` | `Zephyr` | голос TTS |
 | `OPENAI_ASR_LANGUAGE` | `ru` | синоним `ASR_LANGUAGE` |
+| `SYSTEM_PROMPT_FILES` | все 4 файла из `prompts/` | список файлов system prompt |
+| `SYSTEM_PROMPT_FILE` | — | устаревший одиночный файл (fallback) |
 | `SSL_CERT_FILE` | системный | путь к CA-файлу для HTTPS к AI-API |
 
 Если `OPENAI_BASE_URL`/`OPENAI_API_KEY` (или их `AI_*` синонимы) не заданы,

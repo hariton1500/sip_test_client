@@ -3,6 +3,9 @@
 Хранилище работает только с плоским каталогом (по умолчанию ``prompts/``),
 разрешает текстовые расширения и не выпускает путь за пределы корня. Запись
 атомарная: редактор не оставит наполовину записанный промпт при сбое.
+
+Для LLM несколько файлов можно собрать в один system prompt: порядок задаётся
+списком (``SYSTEM_PROMPT_FILES``), а части разделяются Markdown-разделителем.
 """
 
 from __future__ import annotations
@@ -12,10 +15,22 @@ import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 ALLOWED_SUFFIXES = (".md", ".txt", ".prompt")
 DEFAULT_MAX_BYTES = 2 * 1024 * 1024
+DEFAULT_PROMPT_SEPARATOR = "\n\n---\n\n"
+
+# Порядок важен: сначала общие правила поддержки, затем условия подключения,
+# данные лицевого счёта и тарифы. Все файлы лежат в одном каталоге prompts/.
+DEFAULT_SYSTEM_PROMPT_FILES: Tuple[str, ...] = (
+    "support_evp.md",
+    "connection_terms.md",
+    "billing_account_data.md",
+    "internet_private.md",
+)
+PROMPT_FILES_ENV = "SYSTEM_PROMPT_FILES"
+PROMPT_FILE_ENV = "SYSTEM_PROMPT_FILE"
 
 
 class PromptError(Exception):
@@ -97,6 +112,111 @@ class PromptDocument:
             "modified_ns": str(self.modified_ns),
             "modified_at": self.modified_at,
         }
+
+
+@dataclass(frozen=True)
+class PromptBundle:
+    """Несколько промптов, собранных в один system prompt."""
+
+    documents: Tuple[PromptDocument, ...]
+    separator: str = DEFAULT_PROMPT_SEPARATOR
+
+    def __post_init__(self) -> None:
+        if not self.documents:
+            raise PromptError("Не задано ни одного файла промпта")
+        if not isinstance(self.separator, str):
+            raise PromptError("Разделитель промптов должен быть строкой")
+
+    @property
+    def names(self) -> Tuple[str, ...]:
+        return tuple(document.name for document in self.documents)
+
+    @property
+    def content(self) -> str:
+        """Склеенный текст в порядке ``documents``."""
+        return self.separator.join(document.content for document in self.documents)
+
+    @property
+    def size(self) -> int:
+        return len(self.content.encode("utf-8"))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "names": list(self.names),
+            "content": self.content,
+            "size": self.size,
+        }
+
+
+def _normalise_prompt_name(value: str) -> str:
+    """Принять имя файла или путь и оставить только безопасное имя.
+
+    ``prompts/support_evp.md`` и ``prompts\\support_evp.md`` приводятся к
+    ``support_evp.md``. Непосредственно чтение всё равно проверяет имя в
+    :meth:`PromptStore._resolve`, поэтому выйти за пределы каталога нельзя.
+    """
+    if not isinstance(value, str):
+        raise PromptError("Имя промпта должно быть строкой")
+    name = value.strip().replace("\\", "/")
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    return name
+
+
+def parse_prompt_file_names(value: str) -> Tuple[str, ...]:
+    """Разобрать список файлов из ``SYSTEM_PROMPT_FILES``.
+
+    Разделители: запятая, точка с запятой и перевод строки. Пустые элементы
+    пропускаются, дубликаты схлопываются с сохранением первого вхождения.
+    """
+    if not isinstance(value, str):
+        raise PromptError(f"{PROMPT_FILES_ENV} должен быть строкой")
+    if "\x00" in value:
+        raise PromptError(f"{PROMPT_FILES_ENV} содержит NUL-байт")
+
+    prepared = value.replace("\r", "\n").replace(";", ",").replace("\n", ",")
+    names: List[str] = []
+    for token in prepared.split(","):
+        if not token.strip():
+            continue
+        name = _normalise_prompt_name(token)
+        if not name:
+            continue
+        if name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def resolve_system_prompt_files(
+    environ: Optional[Mapping[str, str]] = None,
+) -> Tuple[str, ...]:
+    """Определить набор prompt-файлов из окружения.
+
+    ``SYSTEM_PROMPT_FILES`` имеет приоритет. Если он пуст, поддерживается
+    старый одиночный ``SYSTEM_PROMPT_FILE`` (в том числе с путём). Если не
+    задано ничего, используется :data:`DEFAULT_SYSTEM_PROMPT_FILES`.
+    """
+    source: Mapping[str, str] = os.environ if environ is None else environ
+
+    def read(name: str) -> str:
+        value = source.get(name, "")
+        return str(value or "").strip()
+
+    configured = read(PROMPT_FILES_ENV)
+    if configured:
+        names = parse_prompt_file_names(configured)
+        if not names:
+            raise PromptError(f"{PROMPT_FILES_ENV} не содержит имён файлов")
+        return names
+
+    legacy = read(PROMPT_FILE_ENV)
+    if legacy:
+        names = parse_prompt_file_names(legacy)
+        if not names:
+            raise PromptError(f"{PROMPT_FILE_ENV} не содержит имени файла")
+        return names
+
+    return DEFAULT_SYSTEM_PROMPT_FILES
 
 
 class PromptStore:
@@ -203,6 +323,51 @@ class PromptStore:
         )
 
     # ------------------------------------------------------------------
+    # Сборка system prompt
+    # ------------------------------------------------------------------
+    def load_many(
+        self,
+        names: Iterable[str],
+        separator: str = DEFAULT_PROMPT_SEPARATOR,
+    ) -> PromptBundle:
+        """Загрузить несколько промптов и склеить их в заданном порядке."""
+        if isinstance(names, str):
+            names = (names,)
+        if names is None:
+            raise PromptError("Список промптов не задан")
+
+        selected: List[str] = []
+        for value in names:
+            name = _normalise_prompt_name(value)
+            if not name:
+                raise PromptError("Пустое имя промпта в списке")
+            if name not in selected:
+                selected.append(name)
+        if not selected:
+            raise PromptError("Не задано ни одного файла промпта")
+
+        documents = tuple(self.read(name) for name in selected)
+        return PromptBundle(documents=documents, separator=separator)
+
+    def load_system_prompt(
+        self,
+        names: Optional[Iterable[str]] = None,
+        separator: str = DEFAULT_PROMPT_SEPARATOR,
+    ) -> PromptBundle:
+        """Собрать system prompt из ``names`` или набора по умолчанию."""
+        selected = DEFAULT_SYSTEM_PROMPT_FILES if names is None else names
+        return self.load_many(selected, separator=separator)
+
+    def load_system_prompt_from_env(
+        self,
+        environ: Optional[Mapping[str, str]] = None,
+        separator: str = DEFAULT_PROMPT_SEPARATOR,
+    ) -> PromptBundle:
+        """Собрать system prompt по ``SYSTEM_PROMPT_FILES``/``SYSTEM_PROMPT_FILE``."""
+        names = resolve_system_prompt_files(environ)
+        return self.load_many(names, separator=separator)
+
+    # ------------------------------------------------------------------
     # Запись
     # ------------------------------------------------------------------
     def create(self, name: str, content: str = "") -> PromptDocument:
@@ -282,6 +447,12 @@ class PromptStore:
 
 __all__ = [
     "ALLOWED_SUFFIXES",
+    "DEFAULT_MAX_BYTES",
+    "DEFAULT_PROMPT_SEPARATOR",
+    "DEFAULT_SYSTEM_PROMPT_FILES",
+    "PROMPT_FILE_ENV",
+    "PROMPT_FILES_ENV",
+    "PromptBundle",
     "PromptConflict",
     "PromptDocument",
     "PromptError",
@@ -289,5 +460,7 @@ __all__ = [
     "PromptNotFound",
     "PromptStore",
     "PromptTooLarge",
+    "parse_prompt_file_names",
+    "resolve_system_prompt_files",
 ]
 
