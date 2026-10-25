@@ -345,12 +345,22 @@ class DialogBot:
             cleared = len(self._out)
             self._out.clear()
             self._epoch += 1
-        logger.info(
-            "Перебивание [%s]: остановлен ответ, отброшено кадров: %d",
-            self._call_id,
-            cleared,
-        )
-        self._publish(SYSTEM, "Абонент перебил бота — ответ остановлен")
+            turn_busy = self._turn_busy
+        if cleared:
+            logger.info(
+                "Перебивание [%s]: остановлен ответ, отброшено кадров: %d",
+                self._call_id,
+                cleared,
+            )
+            self._publish(SYSTEM, "Абонент перебил бота — ответ остановлен")
+        elif turn_busy:
+            # Аудио ещё не зазвучало, но ASR/LLM уже в работе: отменяем
+            # текущую реплику, чтобы не отвечать на устаревший фрагмент.
+            logger.info(
+                "Перебивание [%s]: текущая реплика отменена до начала ответа",
+                self._call_id,
+            )
+            self._publish(SYSTEM, "Абонент продолжил говорить — реплика отменена")
 
     # ------------------------------------------------------------------
     # ASR / LLM / TTS
