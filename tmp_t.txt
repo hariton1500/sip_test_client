@@ -1,8 +1,0 @@
-﻿....................................                                     [100%]
-============================== warnings summary ===============================
-C:\Users\user\AppData\Local\Programs\Python\Python312\Lib\site-packages\pyVoIP\RTP.py:4
-  C:\Users\user\AppData\Local\Programs\Python\Python312\Lib\site-packages\pyVoIP\RTP.py:4: DeprecationWarning: 'audioop' is deprecated and slated for removal in Python 3.13
-    import audioop
-
--- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-36 passed, 1 warning in 0.35s
