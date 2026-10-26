@@ -277,6 +277,23 @@ HANDLED_RESPONSES = (
 )
 
 
+def _cseq_hint(message: SIPMessage) -> str:
+    """«2 INVITE» из заголовка CSeq (или пустая строка, если CSeq нет)."""
+    cseq = message.headers.get("CSeq") or {}
+    if isinstance(cseq, dict):
+        return f"{cseq.get('check')} {cseq.get('method')}".strip()
+    return str(cseq)
+
+
+def _via_hint(message: SIPMessage) -> str:
+    """branch верхнего Via: по нему видно, ретрансмиссия это или новый запрос."""
+    via = message.headers.get("Via") or []
+    first = via[0] if isinstance(via, list) and via else via
+    if isinstance(first, dict):
+        return str(first.get("branch", ""))
+    return ""
+
+
 def _parse_message(self: SIPClient, message: SIPMessage) -> None:
     """``SIPClient.parse_message`` с ответом на сервисные запросы.
 
@@ -286,16 +303,43 @@ def _parse_message(self: SIPClient, message: SIPMessage) -> None:
     ``TODO: Add 500 Error on Receiving SIP Response`` без статуса.
     """
     if is_request(message):
-        if answer_request(self, message):
-            return
-    elif message.status not in HANDLED_RESPONSES:
-        level = logging.DEBUG if int(message.status) < 200 else logging.WARNING
-        logger.log(
-            level,
-            "SIP: ответ %s не обрабатывается pyVoIP (Call-ID %s)",
-            message.status,
+        logger.debug(
+            "SIP: <- %s (CSeq %s, Via %s, Call-ID %s)",
+            message.method,
+            _cseq_hint(message),
+            _via_hint(message),
             message.headers.get("Call-ID"),
         )
+        if answer_request(self, message):
+            return
+    else:
+        logger.debug(
+            "SIP: <- %s (CSeq %s, Via %s, Call-ID %s)",
+            message.status,
+            _cseq_hint(message),
+            _via_hint(message),
+            message.headers.get("Call-ID"),
+        )
+        if message.status == SIPStatus.OK and _cseq_hint(message).endswith("INVITE"):
+            try:
+                ack_uri = _ack_request_uri(message)
+            except Exception:  # noqa: BLE001 - в логах важнее не упасть
+                ack_uri = "?"
+            logger.debug(
+                "SIP: 200 OK на INVITE: ACK Request-URI %s, Contact %s, "
+                "Record-Route %s",
+                ack_uri,
+                message.headers.get("Contact"),
+                message.headers.get("Record-Route"),
+            )
+        if message.status not in HANDLED_RESPONSES:
+            level = logging.DEBUG if int(message.status) < 200 else logging.WARNING
+            logger.log(
+                level,
+                "SIP: ответ %s не обрабатывается pyVoIP (Call-ID %s)",
+                message.status,
+                message.headers.get("Call-ID"),
+            )
     _original_parse_message(self, message)  # type: ignore[misc]
 
 
@@ -616,6 +660,12 @@ def _gen_ack(self: SIPClient, request: SIPMessage) -> str:
     ack += f"CSeq: {request.headers['CSeq']['check']} ACK\r\n"
     ack += f"User-Agent: pyVoIP {pyVoIP.__version__}\r\n"
     ack += "Content-Length: 0\r\n\r\n"
+    logger.debug(
+        "ACK -> %s (To %s, CSeq %s ACK)",
+        ack.split("\r\n", 1)[0],
+        to_header,
+        request.headers["CSeq"]["check"],
+    )
     return ack
 
 
@@ -643,10 +693,25 @@ def _ensure_proxy_challenge(response: SIPMessage) -> None:
 
 def _authorize_invite(
     self: SIPClient,
-    invite: str,
     response: SIPMessage,
-) -> None:
-    """Отвечает на 401/407 авторизованным INVITE (как pyVoIP для REGISTER)."""
+    number: str,
+    sess_id: int,
+    ms: Dict[int, Dict[int, PayloadType]],
+    sendtype,
+    call_id: str,
+) -> str:
+    """Отвечает на ``401``/``407`` авторизованным INVITE (как pyVoIP для REGISTER).
+
+    Два обязательных условия, без которых АТС (Asterisk) молча игнорирует
+    повтор: не-2xx финальный ответ подтверждается ``ACK``, а сам INVITE должен
+    быть **новой транзакцией** — свежий ``branch`` и следующий ``CSeq``. Если
+    переслать тот же текст с добавленным заголовком, АТС считает его
+    ретрансмиссией, повторяет ``401`` (pyVoIP такой ответ «обрабатывает» без
+    записи в лог) и звонок висит до таймаута.
+
+    Возвращает текст отправленного INVITE: вызывающий код должен вернуть именно
+    его, иначе ``ACK`` на ``200 OK`` уйдёт с прежним ``CSeq``.
+    """
     ack = self.gen_ack(response)
     self.out.sendto(ack.encode("utf8"), (self.server, self.port))
     try:
@@ -656,7 +721,7 @@ def _authorize_invite(
         realm = response.authentication["realm"]
     except Exception:  # noqa: BLE001 - без авторизации звонок всё равно не выйдет
         logger.exception("Не удалось построить авторизацию INVITE")
-        return
+        return ""
 
     header = (
         "Proxy-Authorization"
@@ -668,9 +733,20 @@ def _authorize_invite(
         f'nonce="{nonce}",uri="sip:{self.server};transport=UDP",'
         f'response="{authhash.decode("utf8")}",algorithm=MD5\r\n'
     )
-    authorized = invite.replace("\r\nContent-Length", f"\r\n{auth}Content-Length")
+    invite = self.gen_invite(
+        number, str(sess_id), ms, sendtype, self.gen_branch(), call_id
+    )
+    authorized = invite.replace(
+        "\r\nContent-Length", f"\r\n{auth}Content-Length", 1
+    )
     self.out.sendto(authorized.encode("utf8"), (self.server, self.port))
-    logger.info("INVITE отправлен с авторизацией (%s)", header)
+    _, _, cseq = authorized.partition("CSeq: ")
+    logger.info(
+        "Повторный INVITE с авторизацией (%s, CSeq %s)",
+        header,
+        cseq.split("\r\n", 1)[0],
+    )
+    return authorized
 
 
 def _invite(
@@ -722,7 +798,11 @@ def _invite(
                 SIPStatus.UNAUTHORIZED,
                 SIPStatus.PROXY_AUTHENTICATION_REQUIRED,
             ):
-                _authorize_invite(self, invite, response)
+                authorized = _authorize_invite(
+                    self, response, number, sess_id, ms, sendtype, call_id
+                )
+                if authorized:
+                    invite = authorized
                 break
             parse_message_safely(self, response)
             break

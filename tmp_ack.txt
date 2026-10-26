@@ -1,0 +1,21 @@
+﻿ACK sip:+79780481885@91.195.230.4:5060 SIP/2.0
+
+Via: SIP/2.0/UDP 172.18.185.162:5060;branch=z9hG4bK6b86b273ff34fce19d6b804ef;rport
+
+Max-Forwards: 70
+
+To: <sip:+79780481885@sip.evpanet.com>;tag=as5f3a2b1c
+
+From: <sip:503@172.18.185.162>;tag=7f3c1a2b
+
+Call-ID: 4b227777d4dd1fc61c6f884f48641d02@172.18.185.162:5060
+
+CSeq: 2 ACK
+
+User-Agent: pyVoIP 1.6.8
+
+Content-Length: 0
+
+
+
+

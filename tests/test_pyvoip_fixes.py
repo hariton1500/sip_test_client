@@ -580,6 +580,17 @@ def response_raw(
 INVITE_MEDIA = {40000: {0: PayloadType.PCMU}}
 
 
+def _header_value(raw: str, name: str) -> str:
+    """Значение SIP-заголовка (или параметра ``branch=`` из ``Via``)."""
+    if name == "branch":
+        assert "branch=" in raw
+        return raw.split("branch=", 1)[1].split(";", 1)[0].split("\r\n", 1)[0]
+    for line in raw.split("\r\n"):
+        if line.lower().startswith(name.lower() + ":"):
+            return line.split(":", 1)[1].strip()
+    raise AssertionError(f"в запросе нет заголовка {name}")
+
+
 def test_invite_returns_on_session_progress(monkeypatch):
     """183 Session Progress не должен держать call() внутри recv()."""
     call_id = "test-call-id"
@@ -610,7 +621,12 @@ def test_invite_returns_without_any_response(monkeypatch):
 
 
 def test_invite_authorizes_on_401(monkeypatch):
-    """401 на INVITE обрабатывается так же, как pyVoIP делает для REGISTER."""
+    """401 на INVITE: ACK, затем повтор **новой транзакцией** с Digest.
+
+    Если переслать тот же INVITE с добавленным заголовком (как делал патч
+    раньше), branch и CSeq остаются прежними: Asterisk считает пакет
+    ретрансмиссией, повторяет 401 и звонок висит до таймаута.
+    """
     call_id = "test-call-id"
     challenge = response_raw(
         b"401 Unauthorized",
@@ -623,11 +639,21 @@ def test_invite_authorizes_on_401(monkeypatch):
     client, sock = make_client([challenge])
     monkeypatch.setattr(client, "gen_call_id", lambda: call_id)
 
-    pyvoip_fixes._invite(client, "100", INVITE_MEDIA, TransmitType.SENDRECV)
+    request, _, _ = pyvoip_fixes._invite(
+        client, "100", INVITE_MEDIA, TransmitType.SENDRECV
+    )
 
     texts = [data for data, _ in sock.sent]
-    assert any(text.startswith("ACK ") for text in texts)
-    assert any("Authorization: Digest" in text for text in texts)
+    assert texts[0].startswith("INVITE ")
+    assert texts[1].startswith("ACK ")  # не-2xx финальный ответ обязан на ACK
+    retry = next(text for text in texts if "Authorization: Digest" in text)
+
+    assert _header_value(retry, "CSeq") != _header_value(texts[0], "CSeq")
+    assert _header_value(retry, "branch") != _header_value(texts[0], "branch")
+    assert _header_value(retry, "Call-ID") == call_id
+    # вызывающий код получает именно авторизованный INVITE: иначе ACK на
+    # 200 OK уйдёт с прежним CSeq
+    assert request.raw.startswith(retry.encode("utf8")[:60])
 
 
 def test_invite_authorizes_on_407(monkeypatch):
@@ -646,7 +672,11 @@ def test_invite_authorizes_on_407(monkeypatch):
     pyvoip_fixes._invite(client, "100", INVITE_MEDIA, TransmitType.SENDRECV)
 
     texts = [data for data, _ in sock.sent]
-    assert any("Proxy-Authorization: Digest" in text for text in texts)
+    retry = next(
+        text for text in texts if "Proxy-Authorization: Digest" in text
+    )
+    assert 'nonce="xyz789"' in retry
+    assert _header_value(retry, "branch") != _header_value(texts[0], "branch")
 
 
 def test_unhandled_response_is_logged(caplog):
