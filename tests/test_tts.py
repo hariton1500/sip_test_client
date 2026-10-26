@@ -7,6 +7,7 @@ import wave
 
 import pytest
 
+from sipbot import audio_utils as au
 from sipbot.audio_utils import tone_s16
 from sipbot.tts import TtsService, wav_bytes_to_pcm
 
@@ -69,6 +70,25 @@ def test_tts_accepts_raw_pcm_and_caches_wav(tmp_path):
     pcm, rate = wav_bytes_to_pcm(cached.read_bytes())
     assert rate == 24000
     assert pcm == raw_pcm
+
+
+def test_tts_trims_long_edge_silence():
+    """Gemini добавляет ~0.4 с тишины на края каждого предложения."""
+    pcm = au.silence_s16(400) + tone_s16(440, 200) + au.silence_s16(400)
+    ai = FakeAi(_wav_bytes(pcm, 8000))
+    service = TtsService(ai, cache_dir=None)
+
+    audio = service.audio_u8("привет")
+
+    # 200 мс речи + по 40 мс запаса с каждой стороны (8 кГц, 1 байт = 1 сэмпл).
+    assert 2200 <= len(audio) <= 2400
+
+
+def test_tts_keeps_short_fragments_intact():
+    pcm = tone_s16(440, 20, rate=8000)
+    service = TtsService(FakeAi(_wav_bytes(pcm, 8000)), cache_dir=None)
+
+    assert len(service.audio_u8("да")) == 160
 
 
 def test_tts_survives_unusable_cache_dir(tmp_path):

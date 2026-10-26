@@ -78,16 +78,32 @@ def test_bridge_echoes_audio(tmp_path):
     assert all(len(frame) == 160 for frame in call.written)
 
 
-def test_bridge_sends_silence_when_bot_is_quiet():
+def test_bridge_does_not_write_when_bot_is_quiet():
+    """Тишину отправляет сам pyVoIP; второй пейсер только добавлял провалы."""
     call = FakeCall()
     bridge = MediaBridge(call, bot=SilenceBot())
     bridge.start()
     time.sleep(0.15)
     bridge.stop()
 
-    assert call.written
-    assert all(frame == au.SILENCE_FRAME for frame in call.written)
+    assert call.written == []
     assert bridge.frames_out == 0
+
+
+def test_bridge_limits_lead_but_keeps_all_frames():
+    """Запас ограничен ~100 мс, остальное ждёт в очереди и не теряется."""
+    call = FakeCall()
+    bridge = MediaBridge(call)
+    bridge.inject(b"\x01" * 160 * 100)  # 2 секунды аудио
+
+    bridge.start()
+    time.sleep(0.2)
+    bridge.stop()
+
+    sent = len(call.written)
+    assert 0 < sent < 30  # ~10 кадров за 200 мс, а не все 100
+    assert bridge.dropped == 0
+    assert bridge.stats()["queued"] == 100 - sent
 
 
 def test_bridge_stops_when_call_ended():

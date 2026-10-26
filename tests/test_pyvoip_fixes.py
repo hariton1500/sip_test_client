@@ -9,6 +9,9 @@ from types import SimpleNamespace
 
 import pyVoIP
 import pytest
+
+# pyVoIP.VoIP импортирует SIP и наоборот; без этого файл не собирается отдельно.
+import pyVoIP.VoIP  # noqa: F401
 from pyVoIP.SIP import (
     InvalidAccountInfoError,
     RetryRequiredError,
@@ -354,3 +357,11 @@ def test_install_is_idempotent():
     methods = pyVoIP.SIPCompatibleMethods
     for method in pyvoip_fixes.ANSWERABLE_METHODS:
         assert methods.count(method) == 1
+
+
+def test_install_patches_rtp_transmit_timing():
+    """Передатчик RTP должен ждать дедлайн, а не грубый time.sleep."""
+    from pyVoIP.RTP import RTPClient
+
+    pyvoip_fixes.install()
+    assert RTPClient.trans is pyvoip_fixes._trans

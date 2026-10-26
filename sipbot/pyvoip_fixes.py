@@ -21,7 +21,9 @@
   ``SIPMessage`` мог их разобрать;
 * ``SIPClient.parse_message`` отвечает ``200 OK`` на сервисные запросы;
 * ``SIPClient.recv`` и ``SIPClient.__register`` обслуживают «чужие» сообщения
-  (OPTIONS и т.п.) вместо того, чтобы на них спотыкаться.
+  (OPTIONS и т.п.) вместо того, чтобы на них спотыкаться;
+* ``RTPClient.trans`` ждёт абсолютный дедлайн пакета, а не ``time.sleep(20 мс)``
+  (на Windows такой сон даёт 16/32 мс и рваный звук у абонента).
 
 Публичный API: :func:`install`, :func:`handle_incoming`, :func:`answer_request`.
 """
@@ -32,9 +34,14 @@ import logging
 import select
 import time
 import uuid
+import warnings
 from typing import Optional
 
 import pyVoIP
+
+# pyVoIP.SIP и pyVoIP.VoIP импортируют друг друга; если начать с SIP, получаем
+# partially initialized module. Поэтому сначала инициализируем VoIP.
+import pyVoIP.VoIP  # noqa: F401
 from pyVoIP.SIP import (
     InvalidAccountInfoError,
     RetryRequiredError,
@@ -44,6 +51,12 @@ from pyVoIP.SIP import (
     SIPStatus,
 )
 from pyVoIP.VoIP.status import PhoneStatus
+
+# Важно: после pyVoIP.SIP. Если импортировать RTP первым, pyVoIP.SIP и
+# pyVoIP.VoIP попадают в циклический импорт.
+from pyVoIP.RTP import RTPClient  # noqa: E402
+
+from .timing import now, wait_until
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +256,50 @@ def _recv(self: SIPClient) -> None:
         parse_message_safely(self, message)
 
 
+def _trans(self: RTPClient) -> None:
+    """``RTPClient.trans`` с точным тактом 20 мс на Windows.
+
+    Оригинал спит ``time.sleep(delay)``; системный таймер просыпается через
+    16 или 32 мс вместо 20. Пакеты уходят неравномерно, pyVoIP то опустошает
+    очередь (и шлёт тишину), то копит её — абонент слышит провалы и «затухания».
+    Здесь ждём абсолютный дедлайн, компенсируя время на саму отправку.
+    """
+    interval = (1 / self.preference.rate) * 160 / self.trans_delay_reduction
+    next_at = now()
+    while self.NSD:
+        next_at += interval
+        payload = self.encode_packet(self.pmout.read())
+        packet = b"\x80"  # RFC 1889 V2 No Padding Extension or CC.
+        packet += chr(int(self.preference)).encode("utf8")
+        try:
+            packet += self.outSequence.to_bytes(2, byteorder="big")
+        except OverflowError:
+            self.outSequence = 0
+        try:
+            packet += self.outTimestamp.to_bytes(4, byteorder="big")
+        except OverflowError:
+            self.outTimestamp = 0
+        packet += self.outSSRC.to_bytes(4, byteorder="big")
+        packet += payload
+
+        try:
+            self.sout.sendto(packet, (self.outIP, self.outPort))
+        except OSError:
+            warnings.warn(
+                "RTP Packet failed to send!",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        self.outSequence += 1
+        self.outTimestamp += len(payload)
+        current = now()
+        if next_at < current - 0.05:
+            # Сильно отстали (планировщик ОС) — не копим долг, начинаем заново.
+            next_at = current
+        wait_until(next_at)
+
+
 def _ack_request_uri(request: SIPMessage) -> str:
     """Request-URI для ACK: Contact из ответа, иначе адрес из To."""
     target = str(
@@ -298,10 +355,12 @@ def install() -> None:
     SIPClient.recv = _recv  # type: ignore[method-assign]
     SIPClient.gen_ack = _gen_ack  # type: ignore[method-assign]
     SIPClient._SIPClient__register = _register  # type: ignore[attr-defined]
+    RTPClient.trans = _trans  # type: ignore[method-assign]
 
     _installed = True
     logger.debug(
-        "Патчи pyVoIP применены: ответ 200 OK на %s, устойчивая регистрация",
+        "Патчи pyVoIP применены: ответ 200 OK на %s, устойчивая регистрация, "
+        "точный такт RTP",
         "/".join(ANSWERABLE_METHODS),
     )
 

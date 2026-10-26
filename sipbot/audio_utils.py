@@ -85,18 +85,39 @@ def alaw_encode(pcm_u8: bytes) -> bytes:
 # --------------------------------------------------------------------------
 # Ресемплинг и генерация
 # --------------------------------------------------------------------------
+def _lowpass_kernel(src_rate: int, cutoff_hz: float, taps: int = 241) -> np.ndarray:
+    """Kaiser-windowed sinc ФНЧ с единичным усилением на DC."""
+    taps = max(31, taps | 1)  # нечётное число тапов — симметричный фильтр
+    n = np.arange(taps, dtype=np.float64) - (taps - 1) / 2.0
+    norm = min(1.0, 2.0 * cutoff_hz / src_rate)
+    kernel = norm * np.sinc(norm * n) * np.kaiser(taps, 6.0)
+    return kernel / kernel.sum()
+
+
 def resample_s16(pcm: bytes, src_rate: int, dst_rate: int = SAMPLE_RATE) -> bytes:
-    """Линейный ресемплинг s16le (без ФНЧ — для тест-клиента достаточно)."""
+    """Ресемплинг s16le с ФНЧ при понижении частоты.
+
+    Простая линейная интерполяция при переходе 24 кГц -> 8 кГц работает как
+    децимация без фильтра: всё выше 4 кГц «заворачивается» в речевой диапазон
+    и звучит как шипение/помехи. Поэтому при понижении сначала применяется
+    Kaiser-windowed sinc ФНЧ с полосой 0.45*dst_rate (3.6 кГц для 8 кГц).
+    """
     if src_rate <= 0 or dst_rate <= 0:
         raise ValueError("Частоты дискретизации должны быть положительными")
     if src_rate == dst_rate or not pcm:
         return pcm
 
-    data = np.frombuffer(pcm, dtype="<i2")
+    data = np.frombuffer(pcm, dtype="<i2").astype(np.float64)
+    if dst_rate < src_rate:
+        kernel = _lowpass_kernel(src_rate, 0.45 * dst_rate)
+        pad = kernel.size // 2
+        padded = np.pad(data, (pad, pad), mode="edge")
+        data = np.convolve(padded, kernel, mode="valid")
+
     n_out = max(1, int(round(data.size * dst_rate / src_rate)))
     x_old = np.linspace(0.0, 1.0, data.size, endpoint=False)
     x_new = np.linspace(0.0, 1.0, n_out, endpoint=False)
-    out = np.interp(x_new, x_old, data.astype(np.float64))
+    out = np.interp(x_new, x_old, data)
     return np.clip(np.rint(out), -32768, 32767).astype("<i2").tobytes()
 
 

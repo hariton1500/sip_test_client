@@ -76,6 +76,21 @@ def test_resample_s16_rates():
     assert au.resample_s16(b"", 8000, 16000) == b""
 
 
+def test_resample_suppresses_aliasing():
+    """5 кГц при переходе 24k->8k должны быть задавлены ФНЧ, а не завернуться в 3 кГц."""
+    pcm = au.tone_s16(5000, 100, rate=24000, amplitude=0.8)
+    out = np.frombuffer(au.resample_s16(pcm, 24000, 8000), dtype="<i2")
+    center = out[80:-80]  # без краевых эффектов фильтра
+    assert np.abs(center).max() < 0.1 * 32767
+
+
+def test_resample_keeps_speech_band():
+    pcm = au.tone_s16(1000, 100, rate=24000, amplitude=0.5)
+    out = np.frombuffer(au.resample_s16(pcm, 24000, 8000), dtype="<i2")
+    center = out[80:-80]
+    assert np.abs(center).max() > 0.45 * 32767
+
+
 def test_resample_rejects_bad_rate():
     with pytest.raises(ValueError):
         au.resample_s16(au.tone_s16(440, 20), 0, 8000)

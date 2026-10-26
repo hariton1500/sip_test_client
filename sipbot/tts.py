@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 
 PathLike = Union[str, Path]
 
+#: Порог тишины для обрезки краёв TTS-фрагмента (доля от пика).
+EDGE_TRIM_RATIO = 0.015
+#: Сколько миллисекунд тишины оставить по краям после обрезки.
+EDGE_PAD_MS = 40
+#: Фрагменты с пиком ниже этого уровня не обрезаем (это не речь).
+EDGE_TRIM_MIN_PEAK = 120
+
 
 def pcm_s16_to_wav_bytes(pcm_s16: bytes, rate: int) -> bytes:
     """Упаковать raw s16le PCM в WAV bytes (для единого дискового кэша)."""
@@ -37,6 +44,36 @@ def pcm_s16_to_wav_bytes(pcm_s16: bytes, rate: int) -> bytes:
         wav.setframerate(rate)
         wav.writeframes(pcm_s16)
     return buffer.getvalue()
+
+
+def trim_edge_silence(
+    pcm_s16: bytes,
+    rate: int = SAMPLE_RATE,
+    ratio: float = EDGE_TRIM_RATIO,
+    pad_ms: int = EDGE_PAD_MS,
+) -> bytes:
+    """Обрезать тишину в начале и конце фрагмента, оставив ``pad_ms`` запаса.
+
+    Нужно для TTS, который отдаёт каждое предложение отдельным запросом:
+    Gemini, например, добавляет ~0.4 с тишины в начале и ~0.3 с в конце.
+    Без обрезки на стыке предложений возникают заметные паузы, и речь
+    звучит рвано.
+    """
+    data = np.frombuffer(pcm_s16, dtype="<i2")
+    if data.size == 0 or rate <= 0:
+        return pcm_s16
+    peak = int(np.abs(data).max())
+    if peak < EDGE_TRIM_MIN_PEAK:
+        return pcm_s16
+    loud = np.flatnonzero(np.abs(data) > max(1, int(peak * ratio)))
+    if loud.size == 0:
+        return pcm_s16
+    pad = max(0, int(rate * pad_ms / 1000))
+    start = max(0, int(loud[0]) - pad)
+    end = min(data.size, int(loud[-1]) + 1 + pad)
+    if start == 0 and end == data.size:
+        return pcm_s16
+    return data[start:end].astype("<i2").tobytes()
 
 
 def wav_bytes_to_pcm(data: bytes) -> Tuple[bytes, int]:
@@ -134,7 +171,8 @@ class TtsService:
                     return cached
 
             pcm_s16, rate = self._load_or_synthesize(key, text)
-            audio = s16_to_u8(resample_s16(pcm_s16, rate, SAMPLE_RATE))
+            pcm_8k = resample_s16(pcm_s16, rate, SAMPLE_RATE)
+            audio = s16_to_u8(trim_edge_silence(pcm_8k, SAMPLE_RATE))
             with self._lock:
                 self._memory[key] = audio
                 self._memory.move_to_end(key)
@@ -213,4 +251,9 @@ class TtsService:
                     pass
 
 
-__all__ = ["TtsService", "pcm_s16_to_wav_bytes", "wav_bytes_to_pcm"]
+__all__ = [
+    "TtsService",
+    "pcm_s16_to_wav_bytes",
+    "trim_edge_silence",
+    "wav_bytes_to_pcm",
+]
