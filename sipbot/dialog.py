@@ -165,10 +165,12 @@ class DialogConfig:
     max_tool_rounds: int = 3
     barge_in: bool = True
     vad_speech_ms: int = 200
-    vad_silence_ms: int = 900
+    # 600 мс — компромисс для телефонии: заметно быстрее ответ, но ещё не
+    # обрываем паузу внутри фразы. Было 900 мс.
+    vad_silence_ms: int = 600
     vad_max_utterance_ms: int = 10000
     vad_rms_threshold: float = 0.02
-    vad_pre_roll_ms: int = 300
+    vad_pre_roll_ms: int = 200
     # 0 отключает соответствующее поведение.
     no_input_prompt_ms: int = 10000
     no_input_hangup_ms: int = 60000
@@ -196,7 +198,7 @@ class DialogConfig:
             ),
             barge_in=_env_bool(source, "DIALOG_BARGE_IN", True),
             vad_speech_ms=_env_int(source, "VAD_SPEECH_MS", 200, minimum=20),
-            vad_silence_ms=_env_int(source, "VAD_SILENCE_MS", 900, minimum=20),
+            vad_silence_ms=_env_int(source, "VAD_SILENCE_MS", 600, minimum=20),
             vad_max_utterance_ms=_env_int(
                 source, "VAD_MAX_UTTERANCE_MS", 10000, minimum=500
             ),
@@ -204,7 +206,7 @@ class DialogConfig:
                 source, "VAD_RMS_THRESHOLD", 0.02, minimum=0.0
             ),
             vad_pre_roll_ms=_env_int(
-                source, "VAD_PREROLL_MS", 300, minimum=0
+                source, "VAD_PREROLL_MS", 200, minimum=0
             ),
             no_input_prompt_ms=_env_int(
                 source, "DIALOG_NO_INPUT_PROMPT_MS", 10000, minimum=0

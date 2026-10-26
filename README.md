@@ -240,16 +240,25 @@ MAX_INCOMING_LINES=16       # значение по умолчанию для in
 # --- ASR/LLM/TTS (OpenAI-совместимый API) ---
 OPENAI_BASE_URL=https://api.aitunnel.ru/v1
 OPENAI_API_KEY=
-ASR_MODEL=whisper-large-v3
+ASR_MODEL=whisper-large-v3-turbo
 ASR_LANGUAGE=ru
-LLM_MODEL=deepseek-v4-flash
-LLM_MAX_TOKENS=600
+LLM_MODEL=gemini-3.1-flash-lite
+LLM_MAX_TOKENS=150
 LLM_TEMPERATURE=0.3
 AI_TIMEOUT=30
+# Маршрутизация провайдеров LLM (см. docs/provider у AITUNNEL).
+LLM_PROVIDER_MAX_LATENCY_P90=1.2
+LLM_PROVIDER_MIN_THROUGHPUT=0
+LLM_PROVIDER_SORT=
+LLM_PROVIDER_ONLY=
+LLM_PROVIDER_IGNORE=
+LLM_FALLBACK_MODELS=claude-haiku-5.5,deepseek-v4-flash
+LLM_SERVICE_TIER=
+LLM_REASONING_EFFORT=
 
 # --- TTS ---
-TTS_MODEL=tts-1
-TTS_VOICE=nova
+TTS_MODEL=gemini-3.8-flash-lite-tts
+TTS_VOICE=Zephyr
 # AiTunnel/gemini требуют pcm; если провайдер отдаёт WAV, поставьте wav.
 TTS_RESPONSE_FORMAT=pcm
 TTS_SAMPLE_RATE=24000
@@ -260,10 +269,10 @@ TTS_CACHE_DIR=cache/tts
 AI_GREETING=Здравствуйте! Вы позвонили в службу поддержки. Чем я могу вам помочь?
 AI_FALLBACK_REPLY=Извините, не удалось получить ответ. Повторите, пожалуйста.
 VAD_SPEECH_MS=200
-VAD_SILENCE_MS=900
+VAD_SILENCE_MS=600
 VAD_MAX_UTTERANCE_MS=10000
 VAD_RMS_THRESHOLD=0.02
-VAD_PREROLL_MS=300
+VAD_PREROLL_MS=200
 DIALOG_HISTORY_TURNS=12
 DIALOG_MAX_REPLY_CHARS=1200
 DIALOG_MAX_REPLY_SENTENCES=2
@@ -285,10 +294,18 @@ BILLING_TIMEOUT=10
 |---|---|---|
 | `AI_BASE_URL` | — | синоним `OPENAI_BASE_URL` |
 | `AI_API_KEY` | — | синоним `OPENAI_API_KEY` |
-| `OPENAI_ASR_MODEL` | `whisper-large-v3` | синоним `ASR_MODEL` |
-| `LLM_MODEL` / `OPENAI_LLM_MODEL` | `deepseek-v4-flash` | модель LLM |
-| `LLM_MAX_TOKENS` | `600` | лимит completion-токенов; часть уходит на reasoning модели |
+| `OPENAI_ASR_MODEL` | `whisper-large-v3-turbo` | синоним `ASR_MODEL` |
+| `LLM_MODEL` / `OPENAI_LLM_MODEL` | `gemini-3.1-flash-lite` | модель LLM |
+| `LLM_MAX_TOKENS` | `150` | лимит completion-токенов (1–2 предложения); reasoning-моделям нужно больше |
 | `LLM_TEMPERATURE` | `0.3` | вариативность ответа LLM (0.0–2.0) |
+| `LLM_PROVIDER_MAX_LATENCY_P90` | `1.2` | мягкое предпочтение провайдеров с p90 TTFT не выше, с; `0` — выключить |
+| `LLM_PROVIDER_MIN_THROUGHPUT` | `0` | предпочитать провайдеров не медленнее, токенов/с; `0` — выключить |
+| `LLM_PROVIDER_SORT` | — | `price` / `throughput` / `latency`; жёсткий выбор, отключает балансировку |
+| `LLM_PROVIDER_ONLY` | — | slug'и провайдеров через запятую: использовать только их |
+| `LLM_PROVIDER_IGNORE` | — | slug'и провайдеров через запятую: исключить |
+| `LLM_FALLBACK_MODELS` | — | запасные модели AITUNNEL через запятую (до 4); основная добавляется первой |
+| `LLM_SERVICE_TIER` | — | `priority` — быстрее под нагрузкой и дороже, `flex` — дешевле и медленнее |
+| `LLM_REASONING_EFFORT` | — | `low`/`medium`/`high` для reasoning-моделей |
 | `TTS_MODEL` / `OPENAI_TTS_MODEL` | `gemini-3.8-flash-lite-tts` | модель TTS |
 | `TTS_VOICE` / `OPENAI_TTS_VOICE` | `Zephyr` | голос TTS |
 | `TTS_RESPONSE_FORMAT` | `pcm` | формат ответа TTS: `pcm` (raw s16le) или `wav` |
@@ -298,10 +315,10 @@ BILLING_TIMEOUT=10
 | `AI_GREETING` | встроенная фраза | TTS-приветствие в начале звонка; пусто — без приветствия |
 | `AI_FALLBACK_REPLY` | «Извините…» | фраза при ошибке LLM |
 | `VAD_SPEECH_MS` | `200` | сколько речи подтверждает начало реплики |
-| `VAD_SILENCE_MS` | `900` | сколько тишины завершает реплику |
+| `VAD_SILENCE_MS` | `600` | сколько тишины завершает реплику |
 | `VAD_MAX_UTTERANCE_MS` | `10000` | максимальная длительность речи в реплике (тишина не учитывается) |
 | `VAD_RMS_THRESHOLD` | `0.02` | порог энергии речи (0.0–1.0) |
-| `VAD_PREROLL_MS` | `300` | сколько аудио до начала речи сохранить в WAV для ASR |
+| `VAD_PREROLL_MS` | `200` | сколько аудио до начала речи сохранить в WAV для ASR |
 | `DIALOG_HISTORY_TURNS` | `12` | сколько пар «вопрос-ответ» держать в контексте LLM |
 | `DIALOG_MAX_REPLY_CHARS` | `1200` | ограничение длины ответа для TTS |
 | `DIALOG_MAX_REPLY_SENTENCES` | `2` | сколько первых предложений ответа оставлять для телефонии |
@@ -331,6 +348,29 @@ Barge-in работает по энергии входящего сигнала.
 
 Если `OPENAI_BASE_URL`/`OPENAI_API_KEY` (или их `AI_*` синонимы) не заданы,
 ASR/LLM/TTS отключаются; `incoming --ui` работает, но без расшифровки.
+
+### Быстрый набор моделей для телефонии
+
+Замеры AITUNNEL (p50/p90 времени до первого токена по провайдерам, страницы
+моделей, 26.10.2026):
+
+| Роль | Модель | Зачем |
+|---|---|---|
+| ASR | `whisper-large-v3-turbo` | 0.04 ₽/мин, версия large-v3 с ускоренным декодером; для 3–5-секундной реплики заметно быстрее `whisper-large-v3` (0.09 ₽/мин) |
+| LLM | `gemini-3.1-flash-lite` | не reasoning-модель: TTFT p50 0.54–0.77 с, 128–174 ток/с, 50/300 ₽ за 1M токенов |
+| LLM fallback | `claude-haiku-5.5` | TTFT p50 0.42 с, 163 ток/с, 20/100 ₽ за 1M токенов — дешевле и не медленнее |
+| TTS | `gemini-3.8-flash-lite-tts` | 1.8 тыс. ₽ за 1M символов, PCM, русский, низкая задержка; альтернатива — `eleven-flash-v2.5` |
+
+`deepseek-v4-flash` (прежний default) — reasoning-модель: TTFT p50 0.54 с, но
+часть `LLM_MAX_TOKENS` уходит на рассуждения, поэтому при равном лимите ответ
+приходит позже. Если нужна именно она, задайте `LLM_REASONING_EFFORT=low` и
+`LLM_MAX_TOKENS=400`.
+
+Для `/chat/completions` провайдера можно выбирать по задержке:
+`LLM_PROVIDER_MAX_LATENCY_P90` мягко понижает в очереди провайдеров с высоким
+p90 TTFT, `LLM_PROVIDER_SORT=latency` выбирает самого быстрого жёстко (без
+балансировки). Для `/audio/transcriptions` и `/audio/speech` выбор провайдера
+AITUNNEL не поддерживает — там важна только модель.
 
 `SIP_MY_IP` проверяется при старте: `0.0.0.0`, `127.0.0.1` и не-IP значения
 отклоняются. Причина — pyVoIP подставляет `myIP` в SDP (`c=IN IP4 ...`);
@@ -747,8 +787,9 @@ python scripts/sip_trace.py 8 --debug --stack  # хуки register() + стек 
 
 ## Что дальше
 
-1. **Качество VAD/ASR**: сейчас `EnergyVAD` и Whisper Large; для шумной линии
-   имеет смысл `webrtcvad`/Silero и streaming ASR, чтобы отвечать до паузы 900 мс.
+1. **Качество VAD/ASR**: сейчас `EnergyVAD` и Whisper Large Turbo; для шумной
+   линии имеет смысл `webrtcvad`/Silero и streaming ASR, чтобы отвечать до
+   паузы 600 мс.
 2. **Скорость TTS**: ответ теперь синтезируется по предложениям, и первое
    предложение отдаётся в линию сразу. Логи `Задержка ответа` показывают
    `queue`, ASR, LLM, полный TTS, время до первого звука (`first_audio_ms`)

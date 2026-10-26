@@ -509,6 +509,13 @@ def test_dialog_no_input_prompt_then_auto_hangup():
     bot.close()
 
 
+def test_dialog_config_defaults_use_low_latency_vad():
+    config = DialogConfig.from_env({})
+
+    assert config.vad_silence_ms == 600
+    assert config.vad_pre_roll_ms == 200
+
+
 def test_dialog_config_reads_env():
     config = DialogConfig.from_env(
         {
