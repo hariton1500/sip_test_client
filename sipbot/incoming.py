@@ -155,12 +155,31 @@ class CallSession:
         """Синхронно завершает сессию (используется при shutdown)."""
         self._finish(reason="manual")
 
+    def _bot_requested_end(self) -> bool:
+        """Бот попросил завершить звонок и его ответ уже полностью отдан."""
+        bot = self.bot
+        if bot is None or not getattr(bot, "end_call_requested", False):
+            return False
+        bridge = self._bridge
+        if bridge is not None:
+            queued = bridge.stats().get("queued", 0)
+            if queued:
+                return False
+        return True
+
     def _watch_loop(self) -> None:
         """Ждёт, пока абонент положит трубку, и чистит ресурсы."""
         try:
             while True:
                 state = getattr(self.call, "state", None)
                 if state is CallState.ENDED:
+                    break
+                if self._bot_requested_end():
+                    logger.info(
+                        "Бот завершил разговор, сбрасываю звонок: %s",
+                        self.info.call_id,
+                    )
+                    self.phone.hangup(self.call)
                     break
                 time.sleep(0.1)
         except Exception:  # noqa: BLE001

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from sipbot.incoming import caller_info
+from sipbot.incoming import CallSession, caller_info
 
 
 def _call(number: str, caller: str, call_id: str = "call-1"):
@@ -34,3 +34,18 @@ def test_caller_info_handles_missing_from_details():
     assert info.number == "unknown"
     assert info.display == ""
     assert info.call_id == "?"
+
+
+def test_session_waits_for_bridge_queue_before_bot_hangup():
+    call = SimpleNamespace(request=None, call_id="call-end")
+    bot = SimpleNamespace(end_call_requested=True)
+    session = CallSession(call, phone=SimpleNamespace(), bot=bot)
+    session._bridge = SimpleNamespace(stats=lambda: {"queued": 2})
+
+    assert session._bot_requested_end() is False
+
+    session._bridge = SimpleNamespace(stats=lambda: {"queued": 0})
+    assert session._bot_requested_end() is True
+
+    bot.end_call_requested = False
+    assert session._bot_requested_end() is False

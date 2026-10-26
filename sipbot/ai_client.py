@@ -28,6 +28,8 @@ class ChatResponse:
 
     content: str
     tool_calls: Optional[List[Dict[str, Any]]] = None
+    usage: Optional[Dict[str, Any]] = None
+    finish_reason: Optional[str] = None
 
     @property
     def has_tool_calls(self) -> bool:
@@ -78,6 +80,11 @@ class AiClient:
         tts_timeout: float = 20.0,
         asr_language: str = "ru",
         timeout: float = 30.0,
+        # Модель тратит часть completion-токенов на reasoning, поэтому 180
+        # может обрезать финальный ответ. 600 оставляет место и для мыслей,
+        # и для короткой телефонной реплики.
+        llm_max_tokens: int = 600,
+        llm_temperature: float = 0.3,
         ssl_context: Optional[ssl.SSLContext] = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -91,6 +98,8 @@ class AiClient:
         self.tts_timeout = tts_timeout
         self.asr_language = asr_language
         self.timeout = timeout
+        self.llm_max_tokens = max(1, int(llm_max_tokens))
+        self.llm_temperature = min(2.0, max(0.0, float(llm_temperature)))
         self._ssl_context = ssl_context or _default_ssl_context()
 
     @classmethod
@@ -146,6 +155,8 @@ class AiClient:
             tts_timeout=read_float("TTS_TIMEOUT", 20.0),
             asr_language=read("ASR_LANGUAGE", "OPENAI_ASR_LANGUAGE", default="ru"),
             timeout=read_float("AI_TIMEOUT", 30.0),
+            llm_max_tokens=read_int("LLM_MAX_TOKENS", 600),
+            llm_temperature=read_float("LLM_TEMPERATURE", 0.3),
         )
 
     def _request(
@@ -237,6 +248,8 @@ class AiClient:
         payload: Dict[str, Any] = {
             "model": self.llm_model,
             "messages": messages,
+            "max_tokens": self.llm_max_tokens,
+            "temperature": self.llm_temperature,
         }
         if tools:
             payload["tools"] = tools
@@ -247,8 +260,23 @@ class AiClient:
         message = choice.get("message", {})
         content = message.get("content") or ""
         tool_calls = message.get("tool_calls")
+        usage = result.get("usage")
+        finish_reason = choice.get("finish_reason")
+        if usage:
+            logger.info(
+                "LLM usage: prompt=%s completion=%s total=%s finish=%s",
+                usage.get("prompt_tokens", "?"),
+                usage.get("completion_tokens", "?"),
+                usage.get("total_tokens", "?"),
+                finish_reason or "?",
+            )
         logger.debug("LLM: content=%r tool_calls=%s", content, bool(tool_calls))
-        return ChatResponse(content=content, tool_calls=tool_calls)
+        return ChatResponse(
+            content=content,
+            tool_calls=tool_calls,
+            usage=usage,
+            finish_reason=finish_reason,
+        )
 
     def synthesize(self, text: str) -> bytes:
         """Синтезировать речь.

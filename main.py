@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from sipbot.ai_client import AiClient
+from sipbot.billing import BillingClient
 from sipbot.bots import Bot, build_bot
 from sipbot.config import Settings
 from sipbot.dialog import DialogBot, DialogConfig
@@ -66,6 +67,7 @@ def build_dialog_factory(
     store: Optional[TranscriptStore],
     system_prompt: str,
     config: DialogConfig,
+    billing: Optional[BillingClient] = None,
 ) -> Callable[[], DialogBot]:
     """Создать фабрику диалоговых ботов с общим TTS-кэшем.
 
@@ -97,6 +99,7 @@ def build_dialog_factory(
             config=config,
             tts=tts,
             greeting_audio=greeting_audio,
+            billing=billing,
         )
 
     return factory
@@ -202,6 +205,7 @@ def cmd_incoming(settings: Settings, args: argparse.Namespace) -> int:
     requested_bot = raw_bot.lower() if raw_bot.lower() in ("auto", "ai") else raw_bot
     store = TranscriptStore() if args.ui else None
     ai = None if args.no_asr else AiClient.from_env()
+    billing = None if args.no_asr else BillingClient.from_env()
     dialog_factory = None
     chosen_bot = requested_bot
 
@@ -230,8 +234,15 @@ def cmd_incoming(settings: Settings, args: argparse.Namespace) -> int:
                 logger.exception("Не удалось загрузить system prompt")
                 logger.error("Проверьте SYSTEM_PROMPT_FILES и каталог prompts/: %s", exc)
                 return 2
+            if billing is None:
+                logger.warning(
+                    "Биллинг не настроен (BILLING_BASE_URL/BILLING_TOKEN); "
+                    "бот сможет предложить оператора, но не назовёт баланс"
+                )
+            else:
+                logger.info("Биллинг подключён: %s", billing.base_url)
             dialog_factory = build_dialog_factory(
-                ai, store, system_prompt, dialog_config
+                ai, store, system_prompt, dialog_config, billing=billing
             )
             chosen_bot = "ai"
 

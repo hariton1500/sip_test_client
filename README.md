@@ -239,6 +239,8 @@ OPENAI_API_KEY=
 ASR_MODEL=whisper-large-v3
 ASR_LANGUAGE=ru
 LLM_MODEL=deepseek-v4-flash
+LLM_MAX_TOKENS=600
+LLM_TEMPERATURE=0.3
 AI_TIMEOUT=30
 
 # --- TTS ---
@@ -257,9 +259,17 @@ VAD_SPEECH_MS=200
 VAD_SILENCE_MS=900
 VAD_MAX_UTTERANCE_MS=10000
 VAD_RMS_THRESHOLD=0.02
+VAD_PREROLL_MS=300
 DIALOG_HISTORY_TURNS=12
 DIALOG_MAX_REPLY_CHARS=1200
+DIALOG_MAX_REPLY_SENTENCES=2
+DIALOG_MAX_TOOL_ROUNDS=3
 DIALOG_BARGE_IN=1
+
+# Биллинг: POST {BILLING_BASE_URL}, Authorization: Bearer {BILLING_TOKEN}
+BILLING_BASE_URL=
+BILLING_TOKEN=
+BILLING_TIMEOUT=10
 ```
 
 Дополнительные переменные AI-клиента (все необязательны):
@@ -270,6 +280,8 @@ DIALOG_BARGE_IN=1
 | `AI_API_KEY` | — | синоним `OPENAI_API_KEY` |
 | `OPENAI_ASR_MODEL` | `whisper-large-v3` | синоним `ASR_MODEL` |
 | `LLM_MODEL` / `OPENAI_LLM_MODEL` | `deepseek-v4-flash` | модель LLM |
+| `LLM_MAX_TOKENS` | `600` | лимит completion-токенов; часть уходит на reasoning модели |
+| `LLM_TEMPERATURE` | `0.3` | вариативность ответа LLM (0.0–2.0) |
 | `TTS_MODEL` / `OPENAI_TTS_MODEL` | `gemini-3.8-flash-lite-tts` | модель TTS |
 | `TTS_VOICE` / `OPENAI_TTS_VOICE` | `Zephyr` | голос TTS |
 | `TTS_RESPONSE_FORMAT` | `pcm` | формат ответа TTS: `pcm` (raw s16le) или `wav` |
@@ -280,11 +292,17 @@ DIALOG_BARGE_IN=1
 | `AI_FALLBACK_REPLY` | «Извините…» | фраза при ошибке LLM |
 | `VAD_SPEECH_MS` | `200` | сколько речи подтверждает начало реплики |
 | `VAD_SILENCE_MS` | `900` | сколько тишины завершает реплику |
-| `VAD_MAX_UTTERANCE_MS` | `10000` | максимальная длина реплики |
+| `VAD_MAX_UTTERANCE_MS` | `10000` | максимальная длительность речи в реплике (тишина не учитывается) |
 | `VAD_RMS_THRESHOLD` | `0.02` | порог энергии речи (0.0–1.0) |
+| `VAD_PREROLL_MS` | `300` | сколько аудио до начала речи сохранить в WAV для ASR |
 | `DIALOG_HISTORY_TURNS` | `12` | сколько пар «вопрос-ответ» держать в контексте LLM |
 | `DIALOG_MAX_REPLY_CHARS` | `1200` | ограничение длины ответа для TTS |
+| `DIALOG_MAX_REPLY_SENTENCES` | `2` | сколько первых предложений ответа оставлять для телефонии |
+| `DIALOG_MAX_TOOL_ROUNDS` | `3` | максимум раундов tool-calls LLM за одну реплику |
 | `DIALOG_BARGE_IN` | `1` | останавливать ответ, когда абонент начинает говорить |
+| `BILLING_BASE_URL` | — | POST-URL биллинга для `get_billing_info` |
+| `BILLING_TOKEN` | — | Bearer-токен биллинга |
+| `BILLING_TIMEOUT` | `10` | таймаут запроса к биллингу, с |
 | `OPENAI_ASR_LANGUAGE` | `ru` | синоним `ASR_LANGUAGE` |
 | `SYSTEM_PROMPT_FILES` | все 4 файла из `prompts/` | список файлов system prompt |
 | `SYSTEM_PROMPT_FILE` | — | устаревший одиночный файл (fallback) |

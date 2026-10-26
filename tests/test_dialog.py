@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import threading
 import time
 
 from sipbot.ai_client import ChatResponse
 from sipbot.audio_utils import SILENCE_FRAME, tone_u8
-from sipbot.dialog import DialogBot, DialogConfig
+from sipbot.dialog import DialogBot, DialogConfig, _is_asr_hallucination
 from sipbot.transcript import BOT, CALLER, SYSTEM, TranscriptStore
 from sipbot.vad import EnergyVAD
 
@@ -26,18 +28,92 @@ class FakeTts:
 
 
 class FakeAi:
-    def __init__(self, reply: str = "Ваш баланс 100 рублей.") -> None:
+    def __init__(
+        self,
+        reply: str = "Ваш баланс 100 рублей.",
+        transcription: str = "какой у меня баланс",
+    ) -> None:
         self.reply = reply
+        self.transcription = transcription
         self.transcribe_calls = []
         self.chat_calls = []
 
     def transcribe(self, wav_bytes, language=None, prompt=None):
         self.transcribe_calls.append((wav_bytes, language, prompt))
-        return "какой у меня баланс"
+        return self.transcription
 
-    def chat(self, messages):
+    def chat(self, messages, tools=None):
         self.chat_calls.append(messages)
         return ChatResponse(content=self.reply)
+
+
+class SequencedAi(FakeAi):
+    """Медленный первый ASR, чтобы вторая реплика успела встать в очередь."""
+
+    def __init__(self, transcriptions, replies) -> None:
+        super().__init__()
+        self.transcriptions = list(transcriptions)
+        self.replies = list(replies)
+        self.first_started = threading.Event()
+        self.release_first = threading.Event()
+
+    def transcribe(self, wav_bytes, language=None, prompt=None):
+        index = len(self.transcribe_calls)
+        self.transcribe_calls.append((wav_bytes, language, prompt))
+        if index == 0:
+            self.first_started.set()
+            assert self.release_first.wait(2.0)
+        return self.transcriptions[index]
+
+    def chat(self, messages, tools=None):
+        index = len(self.chat_calls)
+        self.chat_calls.append(messages)
+        return ChatResponse(content=self.replies[index])
+
+
+class FakeBilling:
+    def __init__(self) -> None:
+        self.accounts = []
+
+    def get_account(self, account_id: str):
+        self.accounts.append(account_id)
+        return {
+            "found": True,
+            "user": {"id": account_id, "extra_account": 429.56},
+        }
+
+
+class ToolAi:
+    """Первый ответ — tool_call, второй — финальный текст."""
+
+    def __init__(self, tool_name: str, arguments: str, final: str) -> None:
+        self.tool_name = tool_name
+        self.arguments = arguments
+        self.final = final
+        self.chat_calls = []
+        self.transcribe_calls = []
+
+    def transcribe(self, wav_bytes, language=None, prompt=None):
+        self.transcribe_calls.append((wav_bytes, language, prompt))
+        return "какой у меня баланс"
+
+    def chat(self, messages, tools=None):
+        self.chat_calls.append((messages, tools))
+        if len(self.chat_calls) == 1:
+            return ChatResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": self.tool_name,
+                            "arguments": self.arguments,
+                        },
+                    }
+                ],
+            )
+        return ChatResponse(content=self.final)
 
 
 def _config(**overrides) -> DialogConfig:
@@ -117,7 +193,103 @@ def test_dialog_runs_asr_llm_tts_and_records_latency():
     assert report is not None
     assert report.call_id == "call-1"
     assert report.asr_ms >= 0 and report.llm_ms >= 0 and report.tts_ms >= 0
-    assert report.total_ms >= report.asr_ms + report.llm_ms + report.tts_ms
+    assert report.queue_ms >= 0
+    assert report.total_ms >= (
+        report.queue_ms + report.asr_ms + report.llm_ms + report.tts_ms
+    )
+
+
+def test_dialog_calls_billing_tool_and_passes_result_to_llm():
+    store = TranscriptStore()
+    billing = FakeBilling()
+    ai = ToolAi(
+        "get_billing_info",
+        '{"account_id":"20"}',
+        "На вашем счёте четыреста двадцать девять рублей пятьдесят шесть копеек.",
+    )
+    bot = DialogBot(
+        ai,
+        "system",
+        store,
+        config=_config(),
+        vad=EnergyVAD(speech_ms=20, silence_ms=20, max_utterance_ms=500),
+        tts=FakeTts(),
+        billing=billing,
+    )
+
+    bot.on_call_started("caller", "call-tool")
+    bot.on_frame(tone_u8(440, 20, amplitude=0.5))
+    bot.on_frame(SILENCE_FRAME)
+    assert _wait_for(lambda: len(bot.latency_reports) == 1)
+    bot.close()
+
+    assert billing.accounts == ["20"]
+    assert len(ai.chat_calls) == 2
+    first_messages, first_tools = ai.chat_calls[0]
+    tool_names = {
+        item["function"]["name"] for item in (first_tools or [])
+    }
+    assert {"get_billing_info", "end_call"} <= tool_names
+    user_message = next(m for m in first_messages if m["role"] == "user")
+    assert user_message["content"] == "какой у меня баланс"
+
+    second_messages = ai.chat_calls[1][0]
+    tool_message = [m for m in second_messages if m["role"] == "tool"][-1]
+    assert tool_message["tool_call_id"] == "call-1"
+    result = json.loads(tool_message["content"])
+    assert result["user"]["extra_account"] == 429.56
+    assert bot.last_latency.text.startswith("На вашем счёте")
+
+
+def test_dialog_end_call_reports_ready_only_after_audio_played():
+    ai = ToolAi("end_call", "{}", "Всего доброго!")
+    bot = DialogBot(
+        ai,
+        "system",
+        config=_config(),
+        vad=EnergyVAD(speech_ms=20, silence_ms=20, max_utterance_ms=500),
+        tts=FakeTts(),
+    )
+
+    bot.on_call_started("caller", "call-end")
+    bot.on_frame(tone_u8(440, 20, amplitude=0.5))
+    bot.on_frame(SILENCE_FRAME)
+    assert _wait_for(lambda: len(bot.latency_reports) == 1)
+
+    # Пока TTS-кадры не разобраны, трубку вешать нельзя.
+    assert bot.pending_output_frames > 0
+    assert bot.end_call_requested is False
+    for _ in range(100):
+        if bot.pending_output_frames == 0:
+            break
+        bot.on_frame(SILENCE_FRAME)
+
+    assert bot.pending_output_frames == 0
+    assert bot.end_call_requested is True
+    bot.close()
+
+
+def test_dialog_barge_in_cancels_pending_end_call():
+    ai = ToolAi("end_call", "{}", "Всего доброго!")
+    bot = DialogBot(
+        ai,
+        "system",
+        config=_config(),
+        vad=EnergyVAD(speech_ms=20, silence_ms=20, max_utterance_ms=500),
+        tts=FakeTts(),
+    )
+
+    bot.on_call_started("caller", "call-end-barge-in")
+    bot.on_frame(tone_u8(440, 20, amplitude=0.5))
+    bot.on_frame(SILENCE_FRAME)
+    assert _wait_for(lambda: len(bot.latency_reports) == 1)
+    assert bot.pending_output_frames > 0
+
+    # Абонент перебил прощание — вешать трубку нельзя.
+    bot.on_frame(tone_u8(440, 20, amplitude=0.5))
+    assert bot.pending_output_frames == 0
+    assert bot.end_call_requested is False
+    bot.close()
 
 
 def test_dialog_queues_full_greeting_and_barge_in_clears_it():
@@ -143,6 +315,93 @@ def test_dialog_queues_full_greeting_and_barge_in_clears_it():
     bot.close()
 
 
+def test_dialog_new_speech_while_preparing_cancels_stale_reply_without_barge_in():
+    store = TranscriptStore()
+    ai = SequencedAi(
+        transcriptions=["первый вопрос", "второй вопрос"],
+        replies=["новый ответ"],
+    )
+    bot = DialogBot(
+        ai,
+        "system",
+        store,
+        config=_config(),
+        vad=EnergyVAD(speech_ms=20, silence_ms=20, max_utterance_ms=500),
+        tts=FakeTts(),
+    )
+
+    bot.on_call_started("caller", "call-4")
+    speech = tone_u8(440, 20, amplitude=0.5)
+
+    # Первая реплика ушла в ASR и «зависла».
+    bot.on_frame(speech)
+    bot.on_frame(SILENCE_FRAME)
+    assert ai.first_started.wait(1.0)
+
+    # Абонент начал говорить снова, пока аудио ещё не играет: это не barge-in,
+    # но старый ответ после подготовки отдавать нельзя.
+    bot.on_frame(speech)
+    bot.on_frame(SILENCE_FRAME)
+    assert not any("перебил" in m["text"] for m in store.snapshot())
+    assert any("уточнён" in m["text"] for m in store.snapshot())
+
+    ai.release_first.set()
+    assert _wait_for(lambda: len(bot.latency_reports) == 1)
+    bot.close()
+
+    assert [m["text"] for m in store.snapshot() if m["role"] == CALLER] == [
+        "первый вопрос",
+        "второй вопрос",
+    ]
+    assert [m["text"] for m in store.snapshot() if m["role"] == BOT] == [
+        "новый ответ"
+    ]
+    # LLM вызван один раз — для второй реплики; история содержит оба вопроса.
+    assert len(ai.chat_calls) == 1
+    assert [m["content"] for m in ai.chat_calls[0][1:]] == [
+        "первый вопрос",
+        "второй вопрос",
+    ]
+    report = bot.last_latency
+    assert report is not None
+    assert report.text == "новый ответ"
+    assert report.queue_ms > 0
+
+
+def test_dialog_drops_whisper_hallucination_without_llm():
+    store = TranscriptStore()
+    ai = FakeAi(transcription="Продолжение следует... Продолжение следует...")
+    bot = DialogBot(
+        ai,
+        "system",
+        store,
+        config=_config(),
+        vad=EnergyVAD(speech_ms=20, silence_ms=20, max_utterance_ms=500),
+        tts=FakeTts(),
+    )
+
+    bot.on_call_started("caller", "call-5")
+    bot.on_frame(tone_u8(440, 20, amplitude=0.5))
+    bot.on_frame(SILENCE_FRAME)
+
+    assert _wait_for(lambda: len(ai.transcribe_calls) == 1)
+    time.sleep(0.05)
+    bot.close()
+
+    assert [m for m in store.snapshot() if m["role"] == CALLER] == []
+    assert ai.chat_calls == []
+    assert bot.latency_reports == []
+
+
+def test_asr_hallucination_filter_keeps_short_real_answers():
+    assert _is_asr_hallucination("Продолжение следует... Продолжение следует...")
+    assert _is_asr_hallucination("Субтитры сделал DimaTorzok")
+    assert _is_asr_hallucination("Спасибо за просмотр!")
+    assert not _is_asr_hallucination("Спасибо.")
+    assert not _is_asr_hallucination("Да.")
+    assert not _is_asr_hallucination("Спасибо, всё понятно.")
+
+
 def test_dialog_close_transcribes_final_utterance_after_hangup():
     store = TranscriptStore()
     ai = FakeAi()
@@ -166,17 +425,35 @@ def test_dialog_close_transcribes_final_utterance_after_hangup():
     assert ai.chat_calls == []
 
 
+def test_dialog_reply_limited_to_two_sentences():
+    bot = DialogBot(
+        FakeAi(),
+        "system",
+        config=_config(max_reply_sentences=2),
+    )
+    assert bot._prepare_reply("Раз. Два! Три?") == "Раз. Два!"
+
+    one = DialogBot(
+        FakeAi(),
+        "system",
+        config=_config(max_reply_sentences=1),
+    )
+    assert one._prepare_reply("Раз. Два!") == "Раз."
+
+
 def test_dialog_config_reads_env():
     config = DialogConfig.from_env(
         {
             "AI_GREETING": "  Добрый день!  ",
             "DIALOG_HISTORY_TURNS": "5",
             "DIALOG_MAX_REPLY_CHARS": "500",
+            "DIALOG_MAX_REPLY_SENTENCES": "3",
             "DIALOG_BARGE_IN": "off",
             "VAD_SPEECH_MS": "250",
             "VAD_SILENCE_MS": "700",
             "VAD_MAX_UTTERANCE_MS": "8000",
             "VAD_RMS_THRESHOLD": "0.03",
+            "VAD_PREROLL_MS": "250",
             "TTS_CACHE_DIR": "",
         }
     )
@@ -184,9 +461,11 @@ def test_dialog_config_reads_env():
     assert config.greeting == "Добрый день!"
     assert config.history_turns == 5
     assert config.max_reply_chars == 500
+    assert config.max_reply_sentences == 3
     assert config.barge_in is False
     assert config.vad_speech_ms == 250
     assert config.vad_silence_ms == 700
     assert config.vad_max_utterance_ms == 8000
     assert config.vad_rms_threshold == 0.03
+    assert config.vad_pre_roll_ms == 250
     assert config.tts_cache_dir is None

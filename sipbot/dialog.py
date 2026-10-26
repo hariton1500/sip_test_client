@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Mapping, Optional
 
 from .audio_utils import FRAME_BYTES, SILENCE_BYTE, iter_frames
+from .billing import BillingClient, BillingError
 from .transcript import BOT, CALLER, SYSTEM, TranscriptStore
 from .tts import TtsService
 from .vad import EnergyVAD
@@ -31,6 +33,81 @@ DEFAULT_GREETING = (
     "Здравствуйте! Вы позвонили в службу поддержки. Чем я могу вам помочь?"
 )
 DEFAULT_FALLBACK = "Извините, не удалось получить ответ. Повторите, пожалуйста."
+
+# Whisper любит «дописывать» финальные титры, если во входном WAV почти нет
+# речи. Фильтруем только фразы, состоящие целиком из таких шаблонов, чтобы не
+# потерять нормальные короткие ответы вроде «Спасибо.» или «Да.».
+ASR_HALLUCINATION_PHRASES = (
+    "продолжение следует",
+    "субтитры сделал",
+    "субтитры сделал dimatorzok",
+    "субтитры создавал",
+    "субтитры создавал dimatorzok",
+    "редактор субтитров",
+    "корректор",
+    "спасибо за просмотр",
+    "спасибо за внимание",
+    "подписывайтесь на канал",
+    "ставьте лайки",
+)
+
+
+def _normalize_for_match(text: str) -> str:
+    normalized = text.lower().replace("ё", "е")
+    normalized = re.sub(r"[^\w\s]+", " ", normalized, flags=re.UNICODE)
+    return " ".join(normalized.split())
+
+
+def _is_asr_hallucination(text: str) -> bool:
+    normalized = _normalize_for_match(text)
+    if not normalized:
+        return False
+    for phrase in ASR_HALLUCINATION_PHRASES:
+        phrase_normalized = _normalize_for_match(phrase)
+        if not phrase_normalized:
+            continue
+        # Фраза целиком или та же фраза, повторённая несколько раз.
+        if normalized == phrase_normalized:
+            return True
+        if not normalized.replace(phrase_normalized, "").strip():
+            return True
+    return False
+
+
+BILLING_TOOL: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "get_billing_info",
+        "description": (
+            "Получить баланс, тариф, остаток дней, статус сети и ремонта "
+            "по номеру лицевого счёта абонента."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "account_id": {
+                    "type": "string",
+                    "description": "Номер лицевого счёта, только цифры",
+                }
+            },
+            "required": ["account_id"],
+        },
+    },
+}
+
+END_CALL_TOOL: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "end_call",
+        "description": (
+            "Завершить звонок после того, как абонент попрощался или разговор "
+            "закончен. Перед вызовом обязательно попрощайтесь."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+DEFAULT_END_CALL_REPLY = "Всего доброго! До свидания."
 
 
 def _env_int(
@@ -81,11 +158,14 @@ class DialogConfig:
     fallback_reply: str = DEFAULT_FALLBACK
     history_turns: int = 12
     max_reply_chars: int = 1200
+    max_reply_sentences: int = 2
+    max_tool_rounds: int = 3
     barge_in: bool = True
     vad_speech_ms: int = 200
     vad_silence_ms: int = 900
     vad_max_utterance_ms: int = 10000
     vad_rms_threshold: float = 0.02
+    vad_pre_roll_ms: int = 300
     tts_cache_dir: Optional[Path] = Path("cache/tts")
 
     @classmethod
@@ -101,6 +181,12 @@ class DialogConfig:
             max_reply_chars=_env_int(
                 source, "DIALOG_MAX_REPLY_CHARS", 1200, minimum=80
             ),
+            max_reply_sentences=_env_int(
+                source, "DIALOG_MAX_REPLY_SENTENCES", 2, minimum=1
+            ),
+            max_tool_rounds=_env_int(
+                source, "DIALOG_MAX_TOOL_ROUNDS", 3, minimum=1
+            ),
             barge_in=_env_bool(source, "DIALOG_BARGE_IN", True),
             vad_speech_ms=_env_int(source, "VAD_SPEECH_MS", 200, minimum=20),
             vad_silence_ms=_env_int(source, "VAD_SILENCE_MS", 900, minimum=20),
@@ -109,6 +195,9 @@ class DialogConfig:
             ),
             vad_rms_threshold=_env_float(
                 source, "VAD_RMS_THRESHOLD", 0.02, minimum=0.0
+            ),
+            vad_pre_roll_ms=_env_int(
+                source, "VAD_PREROLL_MS", 300, minimum=0
             ),
             tts_cache_dir=Path(cache_dir) if cache_dir else None,
         )
@@ -119,6 +208,7 @@ class DialogConfig:
             silence_ms=self.vad_silence_ms,
             max_utterance_ms=self.vad_max_utterance_ms,
             rms_threshold=self.vad_rms_threshold,
+            pre_roll_ms=self.vad_pre_roll_ms,
         )
 
 
@@ -132,6 +222,9 @@ class LatencyReport:
     llm_ms: float
     tts_ms: float
     total_ms: float
+    # Ожидание в очереди до старта ASR: без него сумма этапов не сходится
+    # с total_ms при параллельных/запоздавших репликах.
+    queue_ms: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -140,6 +233,7 @@ class LatencyReport:
             "asr_ms": round(self.asr_ms, 1),
             "llm_ms": round(self.llm_ms, 1),
             "tts_ms": round(self.tts_ms, 1),
+            "queue_ms": round(self.queue_ms, 1),
             "total_ms": round(self.total_ms, 1),
         }
 
@@ -150,6 +244,7 @@ class _Utterance:
     speech_end: float
     epoch: int
     final: bool = False
+    queued_at: float = 0.0
 
 
 class DialogBot:
@@ -167,6 +262,9 @@ class DialogBot:
         greeting_audio: Optional[bytes] = None,
         language: Optional[str] = None,
         asr_prompt: Optional[str] = None,
+        billing: Optional[BillingClient] = None,
+        allow_end_call: bool = True,
+        end_call_reply: str = DEFAULT_END_CALL_REPLY,
     ) -> None:
         if ai is None:
             raise ValueError("DialogBot требует AiClient")
@@ -181,6 +279,11 @@ class DialogBot:
         self._tts = tts or TtsService(ai, cache_dir=self.config.tts_cache_dir)
         self._language = language
         self._asr_prompt = asr_prompt
+        self.billing = billing
+        self._end_call_reply = end_call_reply
+        self._tools: List[Dict[str, Any]] = [BILLING_TOOL]
+        if allow_end_call:
+            self._tools.append(END_CALL_TOOL)
 
         self._call_id = ""
         self._closed = threading.Event()
@@ -192,6 +295,9 @@ class DialogBot:
         self._epoch = 0
         self._turn_busy = False
         self._barge_in_triggered = False
+        # Абонент начал говорить, пока ответ ещё готовится (аудио не играет).
+        self._pending_speech = False
+        self._end_call_requested = False
         self._ended = False
         self._reports: List[LatencyReport] = []
 
@@ -210,6 +316,8 @@ class DialogBot:
             self._epoch = 0
             self._turn_busy = False
             self._barge_in_triggered = False
+            self._pending_speech = False
+            self._end_call_requested = False
             self._ended = False
 
         self._publish(SYSTEM, f"Входящий звонок: {caller_id or 'неизвестный'}")
@@ -259,7 +367,23 @@ class DialogBot:
             if ready:
                 try:
                     wav_bytes = self._vad.flush()
-                    speech_end = time.monotonic() - self._vad.silence_ms / 1000.0
+                    info = self._vad.last_flush_info
+                    trailing_ms = (
+                        info.trailing_silence_ms
+                        if info is not None
+                        else self._vad.silence_ms
+                    )
+                    speech_end = time.monotonic() - trailing_ms / 1000.0
+                    if info is not None:
+                        logger.info(
+                            "VAD [%s]: речь %.2f с, WAV %.2f с, хвост %.2f с "
+                            "(%s)",
+                            self._call_id,
+                            info.speech_ms / 1000.0,
+                            info.buffered_ms / 1000.0,
+                            info.trailing_silence_ms / 1000.0,
+                            info.reason,
+                        )
                     self._barge_in_triggered = False
                     self._enqueue_utterance(wav_bytes, speech_end)
                 except Exception:  # noqa: BLE001
@@ -276,7 +400,22 @@ class DialogBot:
         if self._vad.has_speech:
             try:
                 wav_bytes = self._vad.flush()
-                self._enqueue_utterance(wav_bytes, time.monotonic(), final=True)
+                info = self._vad.last_flush_info
+                trailing_ms = (
+                    info.trailing_silence_ms
+                    if info is not None
+                    else self._vad.silence_ms
+                )
+                speech_end = time.monotonic() - trailing_ms / 1000.0
+                if info is not None:
+                    logger.info(
+                        "VAD [%s]: финальная речь %.2f с, WAV %.2f с (%s)",
+                        self._call_id,
+                        info.speech_ms / 1000.0,
+                        info.buffered_ms / 1000.0,
+                        info.reason,
+                    )
+                self._enqueue_utterance(wav_bytes, speech_end, final=True)
             except Exception:  # noqa: BLE001
                 logger.exception("Не удалось сохранить последнюю реплику")
         else:
@@ -309,6 +448,17 @@ class DialogBot:
             return len(self._out)
 
     @property
+    def end_call_requested(self) -> bool:
+        """LLM попросил завершить звонок, и весь ответ уже отдан в мост."""
+        with self._lock:
+            return (
+                self._end_call_requested
+                and not self._turn_busy
+                and not self._pending_speech
+                and not self._out
+            )
+
+    @property
     def latency_reports(self) -> List[LatencyReport]:
         with self._lock:
             return list(self._reports)
@@ -325,7 +475,15 @@ class DialogBot:
             return
         with self._lock:
             epoch = self._epoch
-        self._queue.put(_Utterance(wav_bytes, speech_end, epoch, final=final))
+        self._queue.put(
+            _Utterance(
+                wav_bytes,
+                speech_end,
+                epoch,
+                final=final,
+                queued_at=time.monotonic(),
+            )
+        )
 
     def _enqueue_audio(self, audio_u8: bytes) -> None:
         if not audio_u8:
@@ -338,29 +496,60 @@ class DialogBot:
         with self._lock:
             return self._out.popleft() if self._out else None
 
+    def _discard_queued_utterances(self) -> int:
+        """Убрать из очереди реплики, которые стали неактуальны после barge-in."""
+        dropped = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return dropped
+            dropped += 1
+
     def _interrupt_if_speaking(self) -> None:
         with self._lock:
-            if not self._turn_busy and not self._out:
+            if self._out:
+                # Реальный barge-in: звук уже играет, его нужно остановить.
+                cleared = len(self._out)
+                self._out.clear()
+                self._epoch += 1
+                self._pending_speech = False
+                self._end_call_requested = False
+                turn_busy = self._turn_busy
+            elif self._turn_busy:
+                # Бот ещё думает/синтезирует и ничего не сказал. Не отменяем
+                # текущую реплику сразу: ASR-текст ещё пригодится истории.
+                # Помечаем, что пришла новая речь, и не отдаём устаревший
+                # ответ в LLM/TTS, когда он будет готов.
+                if self._pending_speech:
+                    return
+                self._pending_speech = True
+                # Прощание отменено: абонент ещё говорит, трубку не вешаем.
+                self._end_call_requested = False
+                cleared = 0
+                turn_busy = True
+            else:
                 return
-            cleared = len(self._out)
-            self._out.clear()
-            self._epoch += 1
-            turn_busy = self._turn_busy
+
         if cleared:
+            dropped = self._discard_queued_utterances()
             logger.info(
-                "Перебивание [%s]: остановлен ответ, отброшено кадров: %d",
+                "Перебивание [%s]: остановлен ответ, отброшено кадров: %d, "
+                "реплик из очереди: %d",
                 self._call_id,
                 cleared,
+                dropped,
             )
             self._publish(SYSTEM, "Абонент перебил бота — ответ остановлен")
         elif turn_busy:
-            # Аудио ещё не зазвучало, но ASR/LLM уже в работе: отменяем
-            # текущую реплику, чтобы не отвечать на устаревший фрагмент.
             logger.info(
-                "Перебивание [%s]: текущая реплика отменена до начала ответа",
+                "Перебивание [%s]: пришла новая речь до начала ответа, "
+                "устаревший ответ будет отменён",
                 self._call_id,
             )
-            self._publish(SYSTEM, "Абонент продолжил говорить — реплика отменена")
+            self._publish(
+                SYSTEM, "Абонент продолжил говорить — ответ будет уточнён"
+            )
 
     # ------------------------------------------------------------------
     # ASR / LLM / TTS
@@ -380,6 +569,9 @@ class DialogBot:
                 continue
 
             with self._lock:
+                # Новая речь уже превратилась в эту реплику — флаг «пришла
+                # новая речь» больше не должен отменять её собственный ответ.
+                self._pending_speech = False
                 self._turn_busy = True
             try:
                 self._process(utterance)
@@ -390,8 +582,123 @@ class DialogBot:
                 with self._lock:
                     self._turn_busy = False
 
+    def _superseded_reason_locked(self, utterance: _Utterance) -> Optional[str]:
+        """Причина отмены ответа; вызывается под ``self._lock``."""
+        if self._closed.is_set():
+            return "звонок завершён"
+        if utterance.epoch != self._epoch:
+            return "перебивание"
+        if self._pending_speech:
+            return "абонент продолжил говорить"
+        return None
+
+    def _abort_if_superseded(self, utterance: _Utterance, stage: str) -> bool:
+        """Проверить, не устарел ли ответ до/во время ASR/LLM/TTS."""
+        with self._lock:
+            reason = self._superseded_reason_locked(utterance)
+        if reason is None:
+            return False
+        with self._lock:
+            # Отменённый ответ не должен тянуть за собой end_call.
+            self._end_call_requested = False
+        logger.info("%s отменён (%s) [%s]", stage, reason, self._call_id)
+        return True
+
+    def _execute_tool_call(self, tool_call: Dict[str, Any]) -> Any:
+        function = tool_call.get("function") or {}
+        name = str(function.get("name") or "")
+        raw_arguments = function.get("arguments") or "{}"
+        try:
+            arguments = (
+                raw_arguments
+                if isinstance(raw_arguments, dict)
+                else json.loads(raw_arguments)
+            )
+        except (TypeError, json.JSONDecodeError) as exc:
+            logger.warning("Некорректные аргументы инструмента %s: %s", name, exc)
+            return {"error": f"Некорректные аргументы: {exc}"}
+        if not isinstance(arguments, dict):
+            return {"error": "Аргументы инструмента должны быть объектом"}
+
+        if name == "get_billing_info":
+            account_id = str(
+                arguments.get("account_id") or arguments.get("userId") or ""
+            ).strip()
+            if self.billing is None:
+                logger.warning("BILLING: инструмент вызван без настроенного клиента")
+                return {"error": "Биллинг не настроен"}
+            try:
+                data = self.billing.get_account(account_id)
+            except BillingError as exc:
+                logger.warning("BILLING: ошибка для счёта %r: %s", account_id, exc)
+                return {"error": str(exc)}
+            logger.info("BILLING: данные по счёту %s получены", account_id)
+            return data
+
+        if name == "end_call":
+            with self._lock:
+                self._end_call_requested = True
+            logger.info("LLM попросил завершить звонок [%s]", self._call_id)
+            return {"ok": True}
+
+        logger.warning("LLM вызвал неизвестный инструмент: %r", name)
+        return {"error": f"Неизвестный инструмент: {name}"}
+
+    def _chat_with_tools(self, messages: List[Dict[str, Any]]) -> Any:
+        """Выполнить tool-calls LLM и вернуть финальный ответ."""
+        for round_index in range(self.config.max_tool_rounds):
+            response = self.ai.chat(messages, tools=self._tools)
+            if not response.has_tool_calls:
+                return response
+
+            tool_calls = response.tool_calls or []
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": response.content or None,
+                    "tool_calls": tool_calls,
+                }
+            )
+            for index, tool_call in enumerate(tool_calls):
+                function = tool_call.get("function") or {}
+                name = str(function.get("name") or "")
+                result = self._execute_tool_call(tool_call)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.get("id")
+                        or f"call-{round_index}-{index}",
+                        "name": name,
+                        "content": json.dumps(
+                            result, ensure_ascii=False, default=str
+                        ),
+                    }
+                )
+            logger.info(
+                "LLM tool round %d [%s]: %s",
+                round_index + 1,
+                self._call_id,
+                ", ".join(
+                    str((call.get("function") or {}).get("name") or "?")
+                    for call in tool_calls
+                ),
+            )
+
+        logger.warning(
+            "LLM не завершил tool-цикл за %d раундов [%s]",
+            self.config.max_tool_rounds,
+            self._call_id,
+        )
+        return self.ai.chat(messages)
+
     def _process(self, utterance: _Utterance) -> None:
-        asr_started = time.monotonic()
+        started_at = time.monotonic()
+        queue_ms = (
+            (started_at - utterance.queued_at) * 1000.0
+            if utterance.queued_at
+            else 0.0
+        )
+        asr_started = started_at
         try:
             text = self.ai.transcribe(
                 utterance.wav_bytes,
@@ -408,22 +715,29 @@ class DialogBot:
         if not text:
             logger.info("ASR [%s]: пустая реплика", self._call_id)
             return
+        if _is_asr_hallucination(text):
+            logger.info(
+                "ASR [%s]: отфильтрована галлюцинация Whisper: %r",
+                self._call_id,
+                text,
+            )
+            return
 
         self._publish(CALLER, text)
         logger.info("ASR [%s]: %s", self._call_id, text)
         with self._lock:
             self._history.append({"role": "user", "content": text})
             self._trim_history_locked()
-            stale = utterance.epoch != self._epoch
 
         # После hangup успеваем распознать последнюю реплику, но уже не
-        # тратим время на LLM/TTS.
-        if self._closed.is_set() or stale:
+        # тратим время на LLM/TTS. Если абонент продолжил говорить, его текст
+        # остаётся в истории, а устаревший ответ не генерируем.
+        if self._abort_if_superseded(utterance, "LLM"):
             return
 
         llm_started = time.monotonic()
         try:
-            response = self.ai.chat(self._messages())
+            response = self._chat_with_tools(self._messages())
             content = (getattr(response, "content", "") or "").strip()
         except Exception as exc:  # noqa: BLE001
             logger.exception("Ошибка LLM [%s]", self._call_id)
@@ -432,14 +746,17 @@ class DialogBot:
         llm_ms = (time.monotonic() - llm_started) * 1000.0
 
         content = self._prepare_reply(content)
+        if not content and self._end_call_requested:
+            # Модель вызвала end_call, но не написала прощание.
+            content = self._end_call_reply
         if not content:
             content = self.config.fallback_reply
         if not content:
             return
 
         with self._lock:
-            if self._closed.is_set() or utterance.epoch != self._epoch:
-                reason = "звонок завершён" if self._closed.is_set() else "перебивание"
+            reason = self._superseded_reason_locked(utterance)
+            if reason is not None:
                 logger.info("Ответ отменён (%s) [%s]", reason, self._call_id)
                 return
             self._history.append({"role": "assistant", "content": content})
@@ -458,8 +775,8 @@ class DialogBot:
         tts_ms = (time.monotonic() - tts_started) * 1000.0
 
         with self._lock:
-            if self._closed.is_set() or utterance.epoch != self._epoch:
-                reason = "звонок завершён" if self._closed.is_set() else "перебивание"
+            reason = self._superseded_reason_locked(utterance)
+            if reason is not None:
                 logger.info("TTS отменён (%s) [%s]", reason, self._call_id)
                 return
             self._enqueue_audio(audio)
@@ -472,13 +789,15 @@ class DialogBot:
             llm_ms=llm_ms,
             tts_ms=tts_ms,
             total_ms=total_ms,
+            queue_ms=queue_ms,
         )
         with self._lock:
             self._reports.append(report)
         logger.info(
-            "Задержка ответа [%s]: ASR %.2f с, LLM %.2f с, TTS %.2f с, "
-            "всего от конца речи %.2f с",
+            "Задержка ответа [%s]: очередь %.2f с, ASR %.2f с, LLM %.2f с, "
+            "TTS %.2f с, всего от конца речи %.2f с",
             self._call_id,
+            queue_ms / 1000.0,
             asr_ms / 1000.0,
             llm_ms / 1000.0,
             tts_ms / 1000.0,
@@ -504,6 +823,10 @@ class DialogBot:
         text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
         text = re.sub(r"[*_#`>]+", "", text)
         text = " ".join(text.split())
+        sentences = re.split(r"(?<=[.!?…])\s+", text)
+        limit_sentences = self.config.max_reply_sentences
+        if len(sentences) > limit_sentences:
+            text = " ".join(sentences[:limit_sentences]).strip()
         limit = self.config.max_reply_chars
         if len(text) <= limit:
             return text
@@ -525,10 +848,14 @@ class DialogBot:
 
 
 __all__ = [
+    "ASR_HALLUCINATION_PHRASES",
+    "BILLING_TOOL",
+    "DEFAULT_END_CALL_REPLY",
     "DEFAULT_FALLBACK",
     "DEFAULT_GREETING",
     "DialogBot",
     "DialogConfig",
+    "END_CALL_TOOL",
     "LatencyReport",
 ]
 
