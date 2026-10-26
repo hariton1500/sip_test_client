@@ -441,6 +441,74 @@ def test_dialog_reply_limited_to_two_sentences():
     assert one._prepare_reply("Раз. Два!") == "Раз."
 
 
+def test_dialog_streams_tts_by_sentence_and_reports_first_audio():
+    ai = FakeAi(reply="Первое предложение. Второе предложение.")
+    tts = FakeTts()
+    bot = DialogBot(
+        ai,
+        "system",
+        config=_config(),
+        vad=EnergyVAD(speech_ms=20, silence_ms=20, max_utterance_ms=500),
+        tts=tts,
+    )
+
+    bot.on_call_started("caller", "call-stream")
+    bot.on_frame(tone_u8(440, 20, amplitude=0.5))
+    bot.on_frame(SILENCE_FRAME)
+    assert _wait_for(lambda: len(bot.latency_reports) == 1)
+    bot.close()
+
+    assert tts.calls == ["Первое предложение.", "Второе предложение."]
+    report = bot.last_latency
+    assert report is not None
+    assert 0 < report.first_audio_ms <= report.total_ms
+
+
+def test_dialog_reply_chunks_keeps_short_sentences_together():
+    assert DialogBot._reply_chunks("Да. Сейчас проверю баланс.") == [
+        "Да. Сейчас проверю баланс."
+    ]
+    assert DialogBot._reply_chunks("Первое. Второе.") == [
+        "Первое. Второе."
+    ]
+
+
+def test_dialog_no_input_prompt_then_auto_hangup():
+    config = _config(no_input_prompt_ms=10, no_input_hangup_ms=1000)
+    store = TranscriptStore()
+    bot = DialogBot(
+        FakeAi(),
+        "system",
+        store,
+        config=config,
+        vad=EnergyVAD(speech_ms=20, silence_ms=20, max_utterance_ms=500),
+        tts=FakeTts(),
+    )
+
+    bot.on_call_started("caller", "call-idle")
+    time.sleep(0.03)
+    bot.on_frame(SILENCE_FRAME)
+    assert _wait_for(
+        lambda: any(
+            m["role"] == BOT and m["text"] == config.no_input_prompt
+            for m in store.snapshot()
+        )
+    )
+
+    for _ in range(100):
+        if bot.pending_output_frames == 0:
+            break
+        bot.on_frame(SILENCE_FRAME)
+
+    # Ещё один кадр фиксирует «бот договорил», после чего имитируем
+    # истёкшие 60 секунд тишины.
+    bot.on_frame(SILENCE_FRAME)
+    bot._quiet_since = time.monotonic() - 2.0
+    bot._check_no_input(time.monotonic())
+    assert bot.end_call_requested is True
+    bot.close()
+
+
 def test_dialog_config_reads_env():
     config = DialogConfig.from_env(
         {
@@ -448,6 +516,9 @@ def test_dialog_config_reads_env():
             "DIALOG_HISTORY_TURNS": "5",
             "DIALOG_MAX_REPLY_CHARS": "500",
             "DIALOG_MAX_REPLY_SENTENCES": "3",
+            "DIALOG_NO_INPUT_PROMPT_MS": "15000",
+            "DIALOG_NO_INPUT_HANGUP_MS": "90000",
+            "DIALOG_NO_INPUT_PROMPT": "Вы здесь?",
             "DIALOG_BARGE_IN": "off",
             "VAD_SPEECH_MS": "250",
             "VAD_SILENCE_MS": "700",
@@ -462,6 +533,9 @@ def test_dialog_config_reads_env():
     assert config.history_turns == 5
     assert config.max_reply_chars == 500
     assert config.max_reply_sentences == 3
+    assert config.no_input_prompt_ms == 15000
+    assert config.no_input_hangup_ms == 90000
+    assert config.no_input_prompt == "Вы здесь?"
     assert config.barge_in is False
     assert config.vad_speech_ms == 250
     assert config.vad_silence_ms == 700

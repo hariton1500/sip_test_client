@@ -91,6 +91,13 @@ def build_dialog_factory(
                 "TTS_VOICE и доступность OPENAI_BASE_URL"
             )
 
+    if config.no_input_prompt and config.no_input_prompt_ms > 0:
+        try:
+            tts.preload(config.no_input_prompt)
+            logger.info("No-input подсказка синтезирована заранее")
+        except Exception:  # noqa: BLE001 - подсказка не критична для звонка
+            logger.exception("Не удалось синтезировать no-input подсказку")
+
     def factory() -> DialogBot:
         return DialogBot(
             ai,

@@ -108,6 +108,9 @@ END_CALL_TOOL: Dict[str, Any] = {
 }
 
 DEFAULT_END_CALL_REPLY = "Всего доброго! До свидания."
+DEFAULT_NO_INPUT_PROMPT = (
+    "Вы ещё здесь? Если вопрос остался, скажите, пожалуйста."
+)
 
 
 def _env_int(
@@ -166,6 +169,10 @@ class DialogConfig:
     vad_max_utterance_ms: int = 10000
     vad_rms_threshold: float = 0.02
     vad_pre_roll_ms: int = 300
+    # 0 отключает соответствующее поведение.
+    no_input_prompt_ms: int = 10000
+    no_input_hangup_ms: int = 60000
+    no_input_prompt: str = DEFAULT_NO_INPUT_PROMPT
     tts_cache_dir: Optional[Path] = Path("cache/tts")
 
     @classmethod
@@ -199,6 +206,16 @@ class DialogConfig:
             vad_pre_roll_ms=_env_int(
                 source, "VAD_PREROLL_MS", 300, minimum=0
             ),
+            no_input_prompt_ms=_env_int(
+                source, "DIALOG_NO_INPUT_PROMPT_MS", 10000, minimum=0
+            ),
+            no_input_hangup_ms=_env_int(
+                source, "DIALOG_NO_INPUT_HANGUP_MS", 60000, minimum=0
+            ),
+            no_input_prompt=str(
+                source.get("DIALOG_NO_INPUT_PROMPT", DEFAULT_NO_INPUT_PROMPT)
+                or ""
+            ).strip(),
             tts_cache_dir=Path(cache_dir) if cache_dir else None,
         )
 
@@ -225,6 +242,9 @@ class LatencyReport:
     # Ожидание в очереди до старта ASR: без него сумма этапов не сходится
     # с total_ms при параллельных/запоздавших репликах.
     queue_ms: float = 0.0
+    # Время от конца речи до первого готового аудио. При синтезе по
+    # предложениям меньше total_ms, потому что second sentence ещё считается.
+    first_audio_ms: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -235,6 +255,7 @@ class LatencyReport:
             "tts_ms": round(self.tts_ms, 1),
             "queue_ms": round(self.queue_ms, 1),
             "total_ms": round(self.total_ms, 1),
+            "first_audio_ms": round(self.first_audio_ms, 1),
         }
 
 
@@ -300,6 +321,11 @@ class DialogBot:
         self._end_call_requested = False
         self._ended = False
         self._reports: List[LatencyReport] = []
+        # No-input: отчёт тишины начинается после того, как бот договорил.
+        self._quiet_since = 0.0
+        self._bot_speaking = False
+        self._idle_prompt_sent = False
+        self._idle_thread: Optional[threading.Thread] = None
 
         self._greeting = self.config.greeting
         self._greeting_audio = greeting_audio
@@ -341,6 +367,11 @@ class DialogBot:
             if audio:
                 self._enqueue_audio(audio)
                 self._publish(BOT, self._greeting)
+
+        with self._lock:
+            self._quiet_since = time.monotonic()
+            self._bot_speaking = bool(self._out)
+            self._idle_prompt_sent = False
         # Приветствие отдаётся не через return, а по кадрам из on_frame:
         # так его можно прервать и не переполнять исходящую очередь.
         return None
@@ -357,11 +388,14 @@ class DialogBot:
                 self._vad.reset()
                 ready = False
 
-            if self.config.barge_in and self._vad.speech_active:
-                if not self._barge_in_triggered:
+            if self._vad.speech_active:
+                with self._lock:
+                    self._quiet_since = time.monotonic()
+                    self._idle_prompt_sent = False
+                if self.config.barge_in and not self._barge_in_triggered:
                     self._barge_in_triggered = True
                     self._interrupt_if_speaking()
-            elif not self._vad.speech_active:
+            else:
                 self._barge_in_triggered = False
 
             if ready:
@@ -389,7 +423,94 @@ class DialogBot:
                 except Exception:  # noqa: BLE001
                     logger.exception("Ошибка завершения реплики")
 
+        self._check_no_input(time.monotonic())
         return self._pop_output()
+
+    def _check_no_input(self, now: float) -> None:
+        """Подсказать абоненту при тишине и затем завершить звонок."""
+        prompt_ms = self.config.no_input_prompt_ms
+        hangup_ms = self.config.no_input_hangup_ms
+        prompt = self.config.no_input_prompt
+        start_prompt = False
+        hangup = False
+        with self._lock:
+            if self._closed.is_set():
+                return
+            if self._out:
+                self._bot_speaking = True
+            elif self._bot_speaking:
+                # Бот только что договорил — с этого момента считаем тишину.
+                self._bot_speaking = False
+                self._quiet_since = now
+
+            if self._ended or self._end_call_requested:
+                return
+            if (
+                self._turn_busy
+                or self._pending_speech
+                or self._out
+                or self._vad.speech_active
+            ):
+                return
+
+            idle_ms = (now - self._quiet_since) * 1000.0
+            if (
+                prompt_ms > 0
+                and prompt
+                and not self._idle_prompt_sent
+                and idle_ms >= prompt_ms
+            ):
+                self._idle_prompt_sent = True
+                start_prompt = True
+            elif (
+                self._idle_prompt_sent
+                and hangup_ms > 0
+                and idle_ms >= hangup_ms
+            ):
+                self._end_call_requested = True
+                hangup = True
+
+        if start_prompt:
+            self._idle_thread = threading.Thread(
+                target=self._idle_prompt_worker,
+                args=(self._call_id, now),
+                name="sipbot-no-input",
+                daemon=True,
+            )
+            self._idle_thread.start()
+        if hangup:
+            logger.info(
+                "Нет ответа %.1f с — завершаю звонок [%s]",
+                hangup_ms / 1000.0,
+                self._call_id,
+            )
+            self._publish(SYSTEM, "Абонент не отвечает — завершаю звонок")
+
+    def _idle_prompt_worker(self, call_id: str, started_at: float) -> None:
+        prompt = self.config.no_input_prompt
+        try:
+            audio = self._tts.audio_u8(prompt)
+        except Exception:  # noqa: BLE001 - тишина не должна рвать звонок
+            logger.exception("Не удалось синтезировать no-input подсказку")
+            return
+
+        with self._lock:
+            if (
+                self._closed.is_set()
+                or self._ended
+                or self._call_id != call_id
+                or self._pending_speech
+                or self._turn_busy
+                or self._out
+                or self._quiet_since > started_at
+            ):
+                return
+            self._enqueue_audio(audio)
+            self._history.append({"role": "assistant", "content": prompt})
+            self._trim_history_locked()
+
+        self._publish(BOT, prompt)
+        logger.info("No-input подсказка [%s]: %s", call_id, prompt)
 
     def on_call_ended(self) -> None:
         with self._lock:
@@ -765,21 +886,28 @@ class DialogBot:
         self._publish(BOT, content)
         logger.info("LLM [%s]: %s", self._call_id, content)
 
+        # Синтезируем по предложениям и отдаём первое сразу: для телефонии
+        # важен time-to-first-audio, а не общая длительность синтеза.
         tts_started = time.monotonic()
-        try:
-            audio = self._tts.audio_u8(content)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Ошибка TTS [%s]", self._call_id)
-            self._publish(SYSTEM, f"Ошибка синтеза речи: {exc}")
-            return
-        tts_ms = (time.monotonic() - tts_started) * 1000.0
-
-        with self._lock:
-            reason = self._superseded_reason_locked(utterance)
-            if reason is not None:
-                logger.info("TTS отменён (%s) [%s]", reason, self._call_id)
+        first_audio_ms = 0.0
+        for chunk in self._reply_chunks(content):
+            try:
+                audio = self._tts.audio_u8(chunk)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Ошибка TTS [%s]", self._call_id)
+                self._publish(SYSTEM, f"Ошибка синтеза речи: {exc}")
                 return
-            self._enqueue_audio(audio)
+            with self._lock:
+                reason = self._superseded_reason_locked(utterance)
+                if reason is not None:
+                    logger.info("TTS отменён (%s) [%s]", reason, self._call_id)
+                    return
+                self._enqueue_audio(audio)
+                if not first_audio_ms:
+                    first_audio_ms = (
+                        time.monotonic() - utterance.speech_end
+                    ) * 1000.0
+        tts_ms = (time.monotonic() - tts_started) * 1000.0
 
         total_ms = (time.monotonic() - utterance.speech_end) * 1000.0
         report = LatencyReport(
@@ -790,17 +918,19 @@ class DialogBot:
             tts_ms=tts_ms,
             total_ms=total_ms,
             queue_ms=queue_ms,
+            first_audio_ms=first_audio_ms,
         )
         with self._lock:
             self._reports.append(report)
         logger.info(
             "Задержка ответа [%s]: очередь %.2f с, ASR %.2f с, LLM %.2f с, "
-            "TTS %.2f с, всего от конца речи %.2f с",
+            "TTS %.2f с, первый звук %.2f с, всего от конца речи %.2f с",
             self._call_id,
             queue_ms / 1000.0,
             asr_ms / 1000.0,
             llm_ms / 1000.0,
             tts_ms / 1000.0,
+            first_audio_ms / 1000.0,
             total_ms / 1000.0,
         )
 
@@ -838,6 +968,26 @@ class DialogBot:
         space = cut.rfind(" ")
         return (cut[:space] if space > 0 else cut).strip()
 
+    @staticmethod
+    def _reply_chunks(text: str) -> List[str]:
+        """Разбить ответ на предложения для потокового TTS.
+
+        Короткие реплики вроде «Да.» приклеиваем к следующему предложению,
+        чтобы TTS не делал неестественную паузу между ними.
+        """
+        parts = [
+            part.strip()
+            for part in re.split(r"(?<=[.!?…])\s+", text)
+            if part.strip()
+        ]
+        chunks: List[str] = []
+        for part in parts:
+            if chunks and len(chunks[-1]) < 15:
+                chunks[-1] = f"{chunks[-1]} {part}"
+            else:
+                chunks.append(part)
+        return chunks or [text]
+
     def _publish(self, role: str, text: str) -> None:
         if self.store is None or not text:
             return
@@ -853,6 +1003,7 @@ __all__ = [
     "DEFAULT_END_CALL_REPLY",
     "DEFAULT_FALLBACK",
     "DEFAULT_GREETING",
+    "DEFAULT_NO_INPUT_PROMPT",
     "DialogBot",
     "DialogConfig",
     "END_CALL_TOOL",
