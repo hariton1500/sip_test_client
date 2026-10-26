@@ -270,6 +270,60 @@ def test_ack_for_non_2xx_keeps_transaction_branch():
     assert ";tag=as06d26d3f\r\n" in ack
 
 
+def test_ack_destination_uses_contact_host_and_port():
+    """ACK на 2xx уходит на URI из Contact (RFC 3261 13.2.2.4)."""
+    client, _ = make_client()
+
+    assert pyvoip_fixes._ack_destination(
+        client, SIPMessage(invite_200_raw())
+    ) == ("91.195.230.4", 5060)
+
+
+def test_ack_destination_falls_back_to_server_without_contact_port():
+    client, _ = make_client()
+    message = SIPMessage(
+        invite_200_raw().replace(
+            b"Contact: <sip:+79780481885@91.195.230.4:5060>",
+            b"Contact: <sip:+79780481885@sip.example.com>",
+        )
+    )
+
+    assert pyvoip_fixes._ack_destination(client, message) == (SERVER, 5060)
+
+
+def test_ack_same_transaction_keeps_invite_branch():
+    """``same_transaction`` оставляет branch INVITE — так требует старый Asterisk."""
+    client, _ = make_client()
+    client.tagLibrary["call-ack-1"] = "localtag"
+
+    ack = client.gen_ack(SIPMessage(invite_200_raw()), same_transaction=True)
+
+    assert ack.startswith("ACK sip:+79780481885@91.195.230.4:5060 SIP/2.0\r\n")
+    assert "branch=z9hG4bKold" in ack
+    assert "CSeq: 2 ACK\r\n" in ack
+
+
+def test_repeated_200_ok_gets_extra_ack_with_invite_branch():
+    """Повтор 200 OK значит, что первый ACK не принят: шлём ACK транзакции INVITE."""
+    client, sock = make_client()
+    client.tagLibrary["call-ack-1"] = "localtag"
+    pyvoip_fixes._ACK_COUNTS.clear()
+
+    pyvoip_fixes._ack_invite_response(client, SIPMessage(invite_200_raw()))
+    assert sock.sent == []  # первый 200 OK подтверждает сам pyVoIP
+
+    pyvoip_fixes._ack_invite_response(client, SIPMessage(invite_200_raw()))
+
+    assert len(sock.sent) == 1
+    ack, addr = sock.sent[0]
+    assert ack.startswith("ACK sip:+79780481885@91.195.230.4:5060 SIP/2.0\r\n")
+    assert "branch=z9hG4bKold" in ack
+    assert "To: <sip:+79780481885@sip.example.com>;tag=as53dd332c\r\n" in ack
+    assert "From: <sip:503@192.168.1.5>;tag=localtag\r\n" in ack
+    assert "CSeq: 2 ACK\r\n" in ack
+    assert addr == ("91.195.230.4", 5060)
+
+
 def test_unknown_404_is_skipped_without_callback(caplog):
     """404 на неизвестный Call-ID (номер не существует) не должен доходить до pyVoIP."""
     client, _ = make_client([register_status_raw(b"404 Not Found", b"1 INVITE")])

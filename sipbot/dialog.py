@@ -604,7 +604,9 @@ class DialogBot:
                 speech_end,
                 epoch,
                 final=final,
-                queued_at=time.monotonic(),
+                # perf_counter, а не monotonic: на Windows monotonic квантуется
+                # миллисекундой, и ожидание в очереди измерялось как 0.0 мс.
+                queued_at=time.perf_counter(),
             )
         )
 
@@ -815,7 +817,8 @@ class DialogBot:
         return self.ai.chat(messages)
 
     def _process(self, utterance: _Utterance) -> None:
-        started_at = time.monotonic()
+        # Та же шкала, что и ``queued_at``: иначе очередь считается по нулю.
+        started_at = time.perf_counter()
         queue_ms = (
             (started_at - utterance.queued_at) * 1000.0
             if utterance.queued_at
@@ -832,7 +835,7 @@ class DialogBot:
             logger.exception("Ошибка ASR [%s]", self._call_id)
             self._publish(SYSTEM, f"Не удалось распознать реплику: {exc}")
             return
-        asr_ms = (time.monotonic() - asr_started) * 1000.0
+        asr_ms = (time.perf_counter() - asr_started) * 1000.0
 
         text = " ".join((text or "").split())
         if not text:

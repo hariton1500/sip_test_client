@@ -332,6 +332,8 @@ def _parse_message(self: SIPClient, message: SIPMessage) -> None:
                 message.headers.get("Contact"),
                 message.headers.get("Record-Route"),
             )
+            if message.headers.get("Call-ID") in self.tagLibrary:
+                _ack_invite_response(self, message)
         if message.status not in HANDLED_RESPONSES:
             level = logging.DEBUG if int(message.status) < 200 else logging.WARNING
             logger.log(
@@ -633,12 +635,79 @@ def _ack_request_uri(request: SIPMessage) -> str:
     return target.strip("<").strip(">")
 
 
-def _gen_ack(self: SIPClient, request: SIPMessage) -> str:
+def _ack_destination(client: SIPClient, request: SIPMessage) -> tuple:
+    """Куда слать ACK: ``host:port`` из Contact ответа, иначе адрес сервера.
+
+    RFC 3261 (13.2.2.4) требует отправлять ACK на 2xx по URI из ``Contact``.
+    Сервер и Contact обычно совпадают, но при NAT/прокси адрес из Contact
+    надёжнее: именно его АТС записала как remote target диалога.
+    """
+    try:
+        uri = _ack_request_uri(request)
+        host_port = uri.split("@", 1)[1].split(";", 1)[0]
+        host, _, port = host_port.rpartition(":")
+        if host and port.isdigit():
+            return (host, int(port))
+    except Exception:  # noqa: BLE001 - разбор Contact не должен рвать звонок
+        logger.debug(
+            "Не удалось разобрать Contact для ACK: %r",
+            request.headers.get("Contact"),
+        )
+    return (client.server, client.port)
+
+
+#: Сколько раз АТС повторила 200 OK по каждому Call-ID (ключ -> счётчик).
+_ACK_COUNTS: Dict[str, int] = {}
+#: Предел размера ``_ACK_COUNTS``, чтобы словарь не рос на длинной сессии.
+_ACK_COUNTS_MAX = 64
+
+
+def _ack_invite_response(client: SIPClient, request: SIPMessage) -> None:
+    """Страховочный ACK на повторный ``200 OK``.
+
+    pyVoIP подтверждает каждый 200 OK, но некоторая АТС (Asterisk 11.x)
+    принимает ACK на 2xx только в транзакции INVITE: со ``branch`` исходного
+    INVITE. Если 200 OK повторился — первый ACK не принят, поэтому отправляем
+    второй вариант ACK (branch INVITE) прямо на адрес из ``Contact``.
+    Повторные ACK для 2xx по RFC 3261 допустимы.
+    """
+    call_id = str(request.headers.get("Call-ID") or "")
+    count = _ACK_COUNTS.get(call_id, 0) + 1
+    if len(_ACK_COUNTS) > _ACK_COUNTS_MAX:
+        _ACK_COUNTS.clear()
+    _ACK_COUNTS[call_id] = count
+    if count == 1:
+        return
+    try:
+        ack = _gen_ack(client, request, same_transaction=True)
+    except Exception:  # noqa: BLE001 - ACK не должен рвать обработку ответа
+        logger.exception("Не удалось построить страховочный ACK на 200 OK")
+        return
+    destination = _ack_destination(client, request)
+    try:
+        client.out.sendto(ack.encode("utf8"), destination)
+    except OSError:
+        logger.exception("Страховочный ACK не отправлен (%s)", destination)
+        return
+    logger.info(
+        "ACK на повтор 200 OK #%d -> %s:%s (branch исходного INVITE)",
+        count - 1,
+        destination[0],
+        destination[1],
+    )
+
+
+def _gen_ack(
+    self: SIPClient, request: SIPMessage, same_transaction: bool = False
+) -> str:
     """ACK с правильным диалоговым To-tag и Contact в Request-URI.
 
     В pyVoIP 1.6.8 ``gen_ack`` каждый раз генерирует новый To-tag. АТС не
     принимает такой ACK. Для ACK на 2xx формируется новая Via-branch
     (новая транзакция), для не-2xx сохраняется branch исходного INVITE.
+
+    ``same_transaction`` принудительно оставляет branch исходного INVITE:
+    так АТС, требующая ACK в транзакции INVITE, принимает подтверждение.
     """
     call_id = request.headers["Call-ID"]
     local_tag = self.tagLibrary[call_id]
@@ -648,8 +717,12 @@ def _gen_ack(self: SIPClient, request: SIPMessage) -> str:
         to_header += f";tag={remote_tag}"
 
     ack = f"ACK {_ack_request_uri(request)} SIP/2.0\r\n"
-    if getattr(request, "status", None) == SIPStatus.OK:
+    is_ok = getattr(request, "status", None) == SIPStatus.OK
+    if is_ok and not same_transaction:
         branch = "z9hG4bK" + self.gen_call_id()[0:25]
+        ack += f"Via: SIP/2.0/UDP {self.myIP}:{self.myPort};branch={branch};rport\r\n"
+    elif is_ok:
+        branch = _via_hint(request) or "z9hG4bK" + self.gen_call_id()[0:25]
         ack += f"Via: SIP/2.0/UDP {self.myIP}:{self.myPort};branch={branch};rport\r\n"
     else:
         ack += self._gen_response_via_header(request)
