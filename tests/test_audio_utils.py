@@ -68,6 +68,60 @@ def test_ulaw_roundtrip_error_is_small():
     assert np.abs(original - restored).max() < 5000
 
 
+def _decode_g711(payload, kind):
+    """Декодирует G.711 в s16 (audioop без DeprecationWarning)."""
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        import audioop
+
+        func = audioop.ulaw2lin if kind == "ulaw" else audioop.alaw2lin
+        return func(payload, 2)
+
+
+def _snr_db(reference, measured):
+    ref = np.frombuffer(reference, dtype="<i2").astype(float)
+    got = np.frombuffer(measured, dtype="<i2").astype(float)
+    return 20 * np.log10(np.sqrt(np.mean(ref ** 2)) / np.sqrt(np.mean((got - ref) ** 2)))
+
+
+@pytest.mark.parametrize(
+    "encode,kind",
+    [(au.s16_to_ulaw, "ulaw"), (au.s16_to_alaw, "alaw")],
+)
+def test_s16_g711_roundtrip_snr(encode, kind):
+    """Прямое кодирование из 16 бит даёт ~37 дБ и не режет 8 кГц в шум."""
+    tone = au.tone_s16(440, 40, amplitude=0.3)
+    decoded = _decode_g711(encode(tone), kind)
+    assert _snr_db(tone, decoded) >= 34.0
+
+
+def test_s16_g711_beats_u8_path():
+    """Старый путь s16 -> u8 -> μ-law терял ~15 дБ (слышимый «песок»).
+
+    Тихая речь (~-20 dBFS): 8-битные отсчёты попадают в узкий участок
+    μ-шкалы, и точность падает до ~22-24 дБ. Прямое кодирование из s16
+    держит ~38 дБ независимо от уровня.
+    """
+    tone = au.tone_s16(440, 40, amplitude=0.1)
+    direct = _snr_db(tone, _decode_g711(au.s16_to_ulaw(tone), "ulaw"))
+    legacy = _snr_db(
+        tone,
+        _decode_g711(au.ulaw_encode(au.s16_to_u8(tone)), "ulaw"),
+    )
+    assert direct >= 34.0
+    assert legacy < 28.0
+    assert direct >= legacy + 10.0
+
+
+def test_s16_g711_silence_and_empty():
+    assert au.s16_to_ulaw(b"\x00\x00" * 160) == b"\xff" * 160
+    assert au.s16_to_alaw(b"\x00\x00" * 160) == b"\xd5" * 160
+    assert au.s16_to_ulaw(b"") == b""
+    assert au.s16_to_alaw(b"") == b""
+
+
 def test_resample_s16_rates():
     pcm = au.tone_s16(440, 100, rate=8000)
     assert len(au.resample_s16(pcm, 8000, 16000)) == 2 * len(pcm)

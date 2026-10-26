@@ -107,7 +107,7 @@ class ToneBot(_LifecycleBot):
         pass
 
 
-class WavFileBot:
+class WavFileBot(_LifecycleBot):
     """Проигрывает WAV-файл (ресемплинг в 8 кГц), затем тишину."""
 
     def __init__(self, path: str, loop: bool = False) -> None:

@@ -6,6 +6,7 @@
     python main.py listen --record in.wav --bot echo
     python main.py dial 1001 --play greeting.wav --record out.wav --duration 20
     python main.py dial 1001 --bot tone --duration 10
+    python main.py dial 1001 --bot ai --duration 30
     python main.py incoming --record-dir ./recordings --max-lines 16
 """
 
@@ -112,6 +113,105 @@ def build_dialog_factory(
     return factory
 
 
+#: Спецификации бота, означающие ASR → LLM → TTS диалог.
+AI_BOT_SPECS = ("auto", "ai")
+
+
+def build_ai_bot_factory(
+    store: Optional[TranscriptStore] = None,
+) -> Optional[Callable[[], Bot]]:
+    """Фабрика AI-бота для исходящего звонка.
+
+    ``None`` означает, что ASR/LLM не настроены (нет ``OPENAI_BASE_URL`` /
+    ``OPENAI_API_KEY``). Приветствие синтезируется один раз при создании
+    фабрики, поэтому к моменту ответа на INVITE оно уже в памяти.
+
+    :raises Exception: system prompt не загрузился (ошибка конфигурации).
+    """
+    ai = AiClient.from_env()
+    if ai is None:
+        return None
+    logger.info(
+        "AI-бот: ASR=%s, LLM=%s, TTS=%s/%s",
+        ai.asr_model,
+        ai.llm_model,
+        ai.tts_model,
+        ai.tts_voice,
+    )
+    system_prompt = load_dialog_prompt()
+    config = DialogConfig.from_env()
+    billing = BillingClient.from_env()
+    if billing is None:
+        logger.warning(
+            "Биллинг не настроен (BILLING_BASE_URL/BILLING_TOKEN); "
+            "бот сможет предложить оператора, но не назовёт баланс"
+        )
+    else:
+        logger.info("Биллинг подключён: %s", billing.base_url)
+    return build_dialog_factory(ai, store, system_prompt, config, billing=billing)
+
+
+def _dial_bot(
+    args: argparse.Namespace,
+) -> "tuple[Optional[str], Optional[Callable[[], Bot]]]":
+    """Определить бота для ``dial``: обычная спецификация или AI-фабрика.
+
+    :raises ValueError: конфликт ``--play``/``--bot ai`` или выбран ``ai``,
+        а AI не настроен.
+    """
+    requested = (args.bot or "").strip()
+    wants_ai = requested.lower() in AI_BOT_SPECS
+    if args.play:
+        if wants_ai:
+            raise ValueError(
+                f"--play уже выбирает бота wav:{args.play}; "
+                f"уберите --bot {requested} или --play"
+            )
+        return f"wav:{args.play}", None
+    if not wants_ai:
+        return (requested or None), None
+    factory = build_ai_bot_factory()
+    if factory is not None:
+        return "ai", factory
+    if requested.lower() == "ai":
+        raise ValueError(
+            "AI-бот не настроен: задайте OPENAI_BASE_URL и OPENAI_API_KEY в .env"
+        )
+    logger.warning("AI недоступен, использую placeholder")
+    return "placeholder", None
+
+
+def _call_id_of(call) -> str:
+    """Call-ID звонка pyVoIP (для логов и DialogBot)."""
+    return str(getattr(call, "call_id", "") or "")
+
+
+def wait_call_end(
+    call,
+    duration: float,
+    bot: Optional[Bot] = None,
+    bridge: Optional[MediaBridge] = None,
+) -> str:
+    """Ждать конца звонка, таймаута или просьбы бота положить трубку.
+
+    В отличие от :meth:`SipPhone.wait_ended` учитывает ``end_call_requested``
+    (LLM вызвал ``end_call``): трубку вешаем только когда ответ уже ушёл в
+    мост. Возвращает ``ended``, ``timeout`` или ``bot``.
+    """
+    started = time.monotonic()
+    while True:
+        state = getattr(getattr(call, "state", None), "name", "")
+        if state == "ENDED":
+            return "ended"
+        if bot is not None and getattr(bot, "end_call_requested", False):
+            queued = bridge.stats().get("queued", 0) if bridge is not None else 0
+            if not queued:
+                return "bot"
+        if duration > 0 and time.monotonic() - started >= duration:
+            return "timeout"
+        time.sleep(0.1)
+
+
 def start_phone(settings: Settings, timeout: float) -> SipPhone:
     phone = SipPhone(settings)
     phone.start()
@@ -131,11 +231,30 @@ def run_call(
     call,
     args: argparse.Namespace,
     bot_spec: Optional[str],
+    bot_factory: Optional[Callable[[], Bot]] = None,
+    caller_id: str = "",
 ) -> None:
-    """Поднимает аудио-мост и ждёт завершения звонка."""
+    """Поднимает аудио-мост и ждёт завершения звонка.
+
+    ``bot_factory`` позволяет создать «свежего» бота на звонок (так работает
+    AI-диалог в ``incoming``); иначе бот строится из ``bot_spec``.
+    Приветствие от ``on_call_started`` сразу уходит в мост, как в CallSession.
+    """
     recorder = Recorder(args.record) if getattr(args, "record", None) else None
-    bot = build_bot(bot_spec)
+    bot = bot_factory() if bot_factory is not None else build_bot(bot_spec)
     bridge = MediaBridge(call, bot=bot, recorder=recorder)
+
+    greeting: Optional[bytes] = None
+    if bot is not None:
+        on_started = getattr(bot, "on_call_started", None)
+        if on_started is not None:
+            try:
+                greeting = on_started(caller_id, _call_id_of(call))
+            except Exception:  # noqa: BLE001 - приветствие не должно рвать звонок
+                logger.exception("Ошибка старта бота")
+    if greeting:
+        bridge.inject(greeting)
+
     bridge.start()
     logger.info(
         "Аудио-мост запущен: бот=%s, запись=%s, длительность=%s",
@@ -144,14 +263,25 @@ def run_call(
         args.duration if args.duration > 0 else "до отбоя",
     )
     try:
-        reason = phone.wait_ended(call, args.duration)
+        reason = wait_call_end(call, args.duration, bot=bot, bridge=bridge)
+        if reason == "bot":
+            logger.info("Бот завершил разговор, сбрасываю звонок")
         logger.info("Звонок завершён (%s)", reason)
     finally:
         bridge.stop()
         if recorder is not None:
             recorder.close()
         if bot is not None:
-            bot.close()
+            on_ended = getattr(bot, "on_call_ended", None)
+            if on_ended is not None:
+                try:
+                    on_ended()
+                except Exception:  # noqa: BLE001
+                    logger.exception("Ошибка завершения бота")
+            try:
+                bot.close()
+            except Exception:  # noqa: BLE001
+                logger.exception("Ошибка закрытия бота")
         logger.info("Статистика обмена: %s", bridge.stats())
 
 
@@ -335,6 +465,15 @@ def cmd_incoming(settings: Settings, args: argparse.Namespace) -> int:
 
 
 def cmd_dial(settings: Settings, args: argparse.Namespace) -> int:
+    try:
+        bot_spec, bot_factory = _dial_bot(args)
+    except ValueError as exc:
+        logger.error("Ошибка конфигурации: %s", exc)
+        return 2
+    except Exception:  # noqa: BLE001 - например, не загрузился system prompt
+        logger.exception("Не удалось подготовить AI-бота")
+        return 2
+
     phone = start_phone(settings, 20.0)
     try:
         call = phone.dial(args.target)
@@ -347,8 +486,14 @@ def cmd_dial(settings: Settings, args: argparse.Namespace) -> int:
             )
             phone.hangup(call)
             return 2
-        bot_spec = f"wav:{args.play}" if args.play else args.bot
-        run_call(phone, call, args, bot_spec)
+        run_call(
+            phone,
+            call,
+            args,
+            bot_spec,
+            bot_factory=bot_factory,
+            caller_id=args.target,
+        )
         phone.hangup(call)
     finally:
         phone.stop()
@@ -403,7 +548,11 @@ def build_parser() -> argparse.ArgumentParser:
     dial.add_argument(
         "--bot",
         default=None,
-        help="обработчик входящего звука: silence|echo|tone|tone:<Гц>:<мс>|wav:<путь>",
+        help=(
+            "обработчик входящего звука: silence|echo|tone|tone:<Гц>:<мс>|"
+            "wav:<путь>|placeholder|auto|ai. auto/ai — диалог ASR/LLM/TTS "
+            "(auto откатывается на placeholder, если AI не настроен)"
+        ),
     )
     dial.add_argument("--record", help="писать звук собеседника в WAV")
     dial.add_argument(

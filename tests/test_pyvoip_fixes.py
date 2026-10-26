@@ -7,11 +7,18 @@
 
 from types import SimpleNamespace
 
+import logging
+import math
+import warnings
+import wave
+
+import numpy as np
 import pyVoIP
 import pytest
 
 # pyVoIP.VoIP импортирует SIP и наоборот; без этого файл не собирается отдельно.
 import pyVoIP.VoIP  # noqa: F401
+from pyVoIP.RTP import PayloadType, TransmitType  # noqa: E402
 from pyVoIP.SIP import (
     InvalidAccountInfoError,
     RetryRequiredError,
@@ -20,7 +27,7 @@ from pyVoIP.SIP import (
     SIPStatus,
 )
 
-from sipbot import pyvoip_fixes
+from sipbot import audio_utils, pyvoip_fixes
 
 SESSION_IP = "192.168.1.5"
 SERVER = "sip.example.com"
@@ -81,6 +88,8 @@ def make_client(incoming=()):
     sock = FakeSocket(incoming)
     client.s = sock
     client.out = sock
+    # Как у запущенного клиента: без этого циклы ждут NSD и сразу выходят.
+    client.NSD = True
     return client, sock
 
 
@@ -361,7 +370,331 @@ def test_install_is_idempotent():
 
 def test_install_patches_rtp_transmit_timing():
     """Передатчик RTP должен ждать дедлайн, а не грубый time.sleep."""
-    from pyVoIP.RTP import RTPClient
+    from pyVoIP.RTP import RTPClient, RTPPacketManager
 
     pyvoip_fixes.install()
     assert RTPClient.trans is pyvoip_fixes._trans
+    assert RTPClient.write is pyvoip_fixes._write
+    assert RTPClient.encode_packet is pyvoip_fixes._encode_packet
+    assert RTPPacketManager.read is pyvoip_fixes._manager_read
+
+
+# ---------------------------------------------------------------------------
+# Исходящий тракт: 16 бит -> G.711 без промежуточного u8
+# ---------------------------------------------------------------------------
+class FakeRtpSocket:
+    """Замена UDP-сокета RTP: складывает отправленные датаграммы."""
+
+    def __init__(self):
+        self.sent = []
+
+    def sendto(self, data, addr):
+        self.sent.append(bytes(data))
+        return len(data)
+
+
+def make_rtp_client_assoc(assoc):
+    """RTPClient с заданным порядком согласованных payload type."""
+    from pyVoIP.RTP import RTPClient
+
+    client = RTPClient(
+        assoc,
+        "127.0.0.1",
+        40000,
+        "127.0.0.1",
+        40002,
+        TransmitType.SENDRECV,
+    )
+    client.sout = FakeRtpSocket()
+    return client
+
+
+def make_rtp_client(payload_type=0):
+    """RTPClient с фейковым сокетом (без bind и потоков)."""
+    return make_rtp_client_assoc(
+        {payload_type: PayloadType(payload_type), 101: PayloadType.EVENT}
+    )
+
+
+def _audioop():
+    """audioop без DeprecationWarning (в 3.13 нужен пакет audioop-lts)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        import audioop
+
+    return audioop
+
+
+def snr_db(reference: bytes, measured: bytes) -> float:
+    """Отношение сигнал/шум между двумя s16le-потоками, дБ."""
+    ref = np.frombuffer(reference, dtype="<i2").astype(np.float64)
+    got = np.frombuffer(measured, dtype="<i2").astype(np.float64)
+    noise = got - ref
+    return 20 * math.log10(np.sqrt(np.mean(ref ** 2)) / np.sqrt(np.mean(noise ** 2)))
+
+
+def test_rtp_write_keeps_16bit_samples():
+    """u8 от приложения превращается в s16 до кодирования G.711."""
+    pcm_u8 = audio_utils.tone_s16(440, 20)  # s16-эталон
+    u8 = audio_utils.s16_to_u8(pcm_u8)
+
+    client = make_rtp_client()
+    client.write(u8)
+
+    stored = client.pmout.read(pyvoip_fixes.PCM16_FRAME_BYTES)
+    assert stored == audio_utils.u8_to_s16(u8)
+
+
+def test_rtp_transmits_pcmu_with_high_snr():
+    """24 кГц -> 8 кГц сигнал уходит в μ-law прямо из 16 бит: SNR ~37 дБ."""
+    pcm = audio_utils.tone_s16(300, 20, amplitude=0.5)
+    u8 = audio_utils.s16_to_u8(pcm)
+
+    client = make_rtp_client(0)
+    sequence = client.outSequence
+    timestamp = client.outTimestamp
+    client.write(u8)
+    payload = pyvoip_fixes._transmit_once(client)
+
+    packet = client.sout.sent[-1]
+    assert packet[12:] == payload
+    assert packet[1] == 0  # PT = PCMU
+    assert len(payload) == 160
+    assert client.outSequence == (sequence + 1) % 0x10000
+    assert client.outTimestamp == (timestamp + 160) % 0x100000000
+
+    decoded = _audioop().ulaw2lin(payload, 2)
+    assert snr_db(audio_utils.u8_to_s16(u8), decoded) >= 34.0
+
+
+def test_rtp_transmits_pcma_as_alaw():
+    """PCMA кодируется A-law, а не μ-law (баг pyVoIP 1.6.8)."""
+    pcm = audio_utils.tone_s16(300, 20, amplitude=0.5)
+    u8 = audio_utils.s16_to_u8(pcm)
+    pcm16 = audio_utils.u8_to_s16(u8)
+
+    client = make_rtp_client(8)
+    client.write(u8)
+    payload = pyvoip_fixes._transmit_once(client)
+
+    assert client.sout.sent[-1][1] == 8  # PT = PCMA
+    assert payload == audio_utils.s16_to_alaw(pcm16)
+    assert payload != audio_utils.s16_to_ulaw(pcm16)
+
+    decoded = _audioop().alaw2lin(payload, 2)
+    assert snr_db(pcm16, decoded) >= 34.0
+
+
+def test_rtp_underrun_is_16bit_silence():
+    """Пустой исходящий буфер добивается нулями, а не 0x80 (это -32640)."""
+    client = make_rtp_client()
+    payload = pyvoip_fixes._transmit_once(client)
+
+    assert payload == b"\xff" * 160  # μ-law нуля
+    assert _audioop().ulaw2lin(payload, 2) == b"\x00\x00" * 160
+
+
+def test_manager_read_pads_silence_per_format():
+    """Буфер входящего аудио по-прежнему добивается 0x80."""
+    from pyVoIP.RTP import RTPPacketManager
+
+    assert RTPPacketManager().read(10) == b"\x80" * 10
+
+
+def test_encode_packet_uses_negotiated_codec():
+    """encode_packet маршрутизирует по PT, а не всегда в μ-law."""
+    pcm16 = audio_utils.tone_s16(500, 20)
+    client = make_rtp_client(0)
+    assert client.encode_packet(pcm16) == audio_utils.s16_to_ulaw(pcm16)
+
+    alaw_client = make_rtp_client(8)
+    assert alaw_client.encode_packet(pcm16) == audio_utils.s16_to_alaw(pcm16)
+
+
+def test_select_audio_codec_prefers_g711():
+    """Из согласованных кодеков выбираем G.711, а не первый payload из SDP."""
+    client = make_rtp_client_assoc(
+        {18: PayloadType.G729, 0: PayloadType.PCMU, 8: PayloadType.PCMA}
+    )
+    assert client.preference is PayloadType.G729
+    assert pyvoip_fixes.select_audio_codec(client) is PayloadType.PCMU
+
+    alaw_only = make_rtp_client_assoc({8: PayloadType.PCMA})
+    assert pyvoip_fixes.select_audio_codec(alaw_only) is PayloadType.PCMA
+
+    unsupported = make_rtp_client_assoc({18: PayloadType.G729})
+    assert pyvoip_fixes.select_audio_codec(unsupported) is None
+
+
+def test_rtp_trans_uses_pcmu_when_sdp_offers_g729_first(monkeypatch):
+    """Передатчик не умирает, если первым в SDP идёт кодек без G.711."""
+    client = make_rtp_client_assoc(
+        {18: PayloadType.G729, 0: PayloadType.PCMU}
+    )
+    client.write(audio_utils.s16_to_u8(audio_utils.tone_s16(300, 20)))
+
+    def stop_after_packet(_deadline):
+        client.NSD = False
+
+    monkeypatch.setattr(pyvoip_fixes, "wait_until", stop_after_packet)
+    pyvoip_fixes._trans(client)
+
+    assert client.preference is PayloadType.PCMU
+    assert client.sout.sent, "передатчик должен отправить хотя бы один пакет"
+    assert client.sout.sent[0][1] == 0  # PT = PCMU
+
+
+def test_rtp_trans_stops_without_g711(monkeypatch, caplog):
+    """Если G.711 не согласован, пишем понятную ошибку и не шлём мусор."""
+    client = make_rtp_client_assoc({101: PayloadType.EVENT})
+
+    monkeypatch.setattr(
+        pyvoip_fixes,
+        "wait_until",
+        lambda _deadline: pytest.fail("передатчик не должен начинать цикл"),
+    )
+    with caplog.at_level(logging.ERROR, logger="sipbot.pyvoip_fixes"):
+        pyvoip_fixes._trans(client)
+
+    assert not client.sout.sent
+    assert "PCMU/PCMA" in caplog.text
+
+
+def response_raw(
+    status_line: bytes,
+    call_id: str = "call-1@192.168.1.5:5060",
+    extra: bytes = b"",
+) -> bytes:
+    return (
+        b"SIP/2.0 " + status_line + b"\r\n"
+        b"Via: SIP/2.0/UDP 192.168.1.5:5060;branch=z9hG4bK1;rport=5060\r\n"
+        b'From: "503" <sip:503@sip.example.com>;tag=a8c9c62d\r\n'
+        b'To: "503" <sip:sip.example.com>;tag=as06d26d3f\r\n'
+        b"Call-ID: " + call_id.encode() + b"\r\n"
+        b"CSeq: 1 INVITE\r\n"
+        + extra
+        + b"Content-Length: 0\r\n\r\n"
+    )
+
+
+INVITE_MEDIA = {40000: {0: PayloadType.PCMU}}
+
+
+def test_invite_returns_on_session_progress(monkeypatch):
+    """183 Session Progress не должен держать call() внутри recv()."""
+    call_id = "test-call-id"
+    client, sock = make_client(
+        [response_raw(b"183 Session Progress", call_id)]
+    )
+    monkeypatch.setattr(client, "gen_call_id", lambda: call_id)
+
+    _, got_call_id, _ = pyvoip_fixes._invite(
+        client, "100", INVITE_MEDIA, TransmitType.SENDRECV
+    )
+
+    assert got_call_id == call_id
+    assert sock.sent[0][0].startswith("INVITE sip:100@")
+
+
+def test_invite_returns_without_any_response(monkeypatch):
+    """Если АТС молчит, INVITE не блокирует вызывающий поток навсегда."""
+    monkeypatch.setattr(pyvoip_fixes, "INVITE_FIRST_RESPONSE_TIMEOUT", 0.05)
+    client, sock = make_client()
+
+    _, call_id, _ = pyvoip_fixes._invite(
+        client, "100", INVITE_MEDIA, TransmitType.SENDRECV
+    )
+
+    assert call_id
+    assert sock.sent and sock.sent[0][0].startswith("INVITE ")
+
+
+def test_invite_authorizes_on_401(monkeypatch):
+    """401 на INVITE обрабатывается так же, как pyVoIP делает для REGISTER."""
+    call_id = "test-call-id"
+    challenge = response_raw(
+        b"401 Unauthorized",
+        call_id,
+        extra=(
+            b'WWW-Authenticate: Digest algorithm=MD5, realm="asterisk", '
+            b'nonce="abc123"\r\n'
+        ),
+    )
+    client, sock = make_client([challenge])
+    monkeypatch.setattr(client, "gen_call_id", lambda: call_id)
+
+    pyvoip_fixes._invite(client, "100", INVITE_MEDIA, TransmitType.SENDRECV)
+
+    texts = [data for data, _ in sock.sent]
+    assert any(text.startswith("ACK ") for text in texts)
+    assert any("Authorization: Digest" in text for text in texts)
+
+
+def test_invite_authorizes_on_407(monkeypatch):
+    """407 Proxy Authentication Required: заголовок Proxy-Authorization."""
+    call_id = "test-call-id"
+    challenge = response_raw(
+        b"407 Proxy Authentication Required",
+        call_id,
+        extra=(
+            b'Proxy-Authenticate: Digest realm="proxy", nonce="xyz789"\r\n'
+        ),
+    )
+    client, sock = make_client([challenge])
+    monkeypatch.setattr(client, "gen_call_id", lambda: call_id)
+
+    pyvoip_fixes._invite(client, "100", INVITE_MEDIA, TransmitType.SENDRECV)
+
+    texts = [data for data, _ in sock.sent]
+    assert any("Proxy-Authorization: Digest" in text for text in texts)
+
+
+def test_unhandled_response_is_logged(caplog):
+    """Отказ АТС (403/407/...) виден в логе, а не только в stdout pyVoIP."""
+    client, _ = make_client()
+    message = SIPMessage(response_raw(b"403 Forbidden"))
+
+    with caplog.at_level(logging.WARNING, logger="sipbot.pyvoip_fixes"):
+        pyvoip_fixes._parse_message(client, message)
+
+    assert "403" in caplog.text
+
+
+def test_session_progress_is_not_a_warning(caplog):
+    """183 Session Progress — нормальный ответ, шуметь о нём не нужно."""
+    client, _ = make_client()
+    message = SIPMessage(response_raw(b"183 Session Progress"))
+
+    with caplog.at_level(logging.DEBUG, logger="sipbot.pyvoip_fixes"):
+        pyvoip_fixes._parse_message(client, message)
+
+    assert "183" in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_codec_is_logged(caplog):
+    """В лог пишется согласованный кодек — это диагностика проблем со звуком."""
+    client = make_rtp_client(0)
+    with caplog.at_level(logging.INFO, logger="sipbot.pyvoip_fixes"):
+        pyvoip_fixes._log_codec(client)
+    assert "PCMU" in caplog.text
+
+
+def test_tx_tap_writes_what_goes_to_network(tmp_path, monkeypatch):
+    """SIPBOT_TX_WAV сохраняет ровно отправленные 16-битные кадры."""
+    target = tmp_path / "tx.wav"
+    monkeypatch.setenv("SIPBOT_TX_WAV", str(target))
+    pcm = audio_utils.tone_s16(440, 20)
+    u8 = audio_utils.s16_to_u8(pcm)
+
+    client = make_rtp_client()
+    client.write(u8)
+    pyvoip_fixes._transmit_once(client)
+    pyvoip_fixes._close_tx_tap(client)
+
+    with wave.open(str(target), "rb") as wav:
+        assert wav.getnchannels() == 1
+        assert wav.getsampwidth() == 2
+        assert wav.getframerate() == 8000
+        assert wav.readframes(wav.getnframes()) == audio_utils.u8_to_s16(u8)
+
