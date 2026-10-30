@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -26,23 +27,51 @@ from sipbot.config import Settings
 from sipbot.dialog import DialogBot, DialogConfig
 from sipbot.incoming import IncomingDispatcher
 from sipbot.media import MediaBridge, Recorder
+from sipbot.metrics import MetricsWriter, format_report, summarize_reports
 from sipbot.phone import SipPhone
 from sipbot.prompts import PromptStore
 from sipbot.transcript import SYSTEM, TranscriptStore
 from sipbot.transcribing_bot import TranscribingBot
-from sipbot.tts import TtsService
+from sipbot.tts_provider import build_tts_service
 from sipbot.ui_server import start_ui_server
 
 logger = logging.getLogger("sipbot")
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
-def setup_logging(verbose: bool) -> None:
+def setup_logging(verbose: bool, log_file: Optional[str] = None) -> None:
+    """Настроить консоль и, если задан, файл лога (UTF-8, дописывание)."""
+    handlers: list = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        path = Path(log_file)
+        if path.parent and str(path.parent):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(path, encoding="utf-8"))
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
+        handlers=handlers,
+        force=log_file is not None,
     )
+
+
+def log_latency_summary(bot, writer: Optional[MetricsWriter] = None) -> None:
+    """Напечатать сводку задержек звонка и дописать её в JSONL."""
+    reports = list(getattr(bot, "latency_reports", ()) or ())
+    if not reports:
+        return
+    logger.info(
+        "Сводка задержек: %s", format_report(summarize_reports(reports), compact=True)
+    )
+    if writer is not None:
+        writer.write_all(reports)
+
+
+def metrics_writer_for(args: argparse.Namespace) -> Optional[MetricsWriter]:
+    """Собрать писатель метрик из ``--metrics-file`` (пусто = выключено)."""
+    path = getattr(args, "metrics_file", None)
+    return MetricsWriter(path) if path else None
 
 
 def load_settings(args: argparse.Namespace) -> Settings:
@@ -76,7 +105,7 @@ def build_dialog_factory(
     на каждом входящем звонке. Если TTS недоступен, клиент продолжает работать:
     бот ответит на реплики, а в лог попадёт ошибка синтеза приветствия.
     """
-    tts = TtsService(ai, cache_dir=config.tts_cache_dir)
+    tts = build_tts_service(ai, cache_dir=config.tts_cache_dir)
     greeting_audio = b""
     if config.greeting:
         try:
@@ -132,11 +161,12 @@ def build_ai_bot_factory(
     if ai is None:
         return None
     logger.info(
-        "AI-бот: ASR=%s, LLM=%s, TTS=%s/%s",
+        "AI-бот: ASR=%s, LLM=%s, TTS=%s/%s (провайдер %s)",
         ai.asr_model,
         ai.llm_model,
         ai.tts_model,
         ai.tts_voice,
+        os.environ.get("TTS_PROVIDER", "cloud"),
     )
     system_prompt = load_dialog_prompt()
     config = DialogConfig.from_env()
@@ -283,6 +313,7 @@ def run_call(
             except Exception:  # noqa: BLE001
                 logger.exception("Ошибка закрытия бота")
         logger.info("Статистика обмена: %s", bridge.stats())
+        log_latency_summary(bot, metrics_writer_for(args))
 
 
 def cmd_register(settings: Settings, args: argparse.Namespace) -> int:
@@ -396,11 +427,12 @@ def cmd_incoming(settings: Settings, args: argparse.Namespace) -> int:
             store.publish(SYSTEM, reason)
         elif dialog_factory is not None:
             logger.info(
-                "AI-бот: ASR=%s, LLM=%s, TTS=%s/%s",
+                "AI-бот: ASR=%s, LLM=%s, TTS=%s/%s (провайдер %s)",
                 ai.asr_model,
                 ai.llm_model,
                 ai.tts_model,
                 ai.tts_voice,
+                os.environ.get("TTS_PROVIDER", "cloud"),
             )
         else:
             logger.info("ASR: модель=%s язык=%s", ai.asr_model, ai.asr_language)
@@ -431,6 +463,7 @@ def cmd_incoming(settings: Settings, args: argparse.Namespace) -> int:
         settings=settings,
         bot_factory=make_bot,
         record_dir=args.record_dir,
+        metrics=metrics_writer_for(args),
     )
     try:
         phone.start(on_incoming=dispatcher.handle_incoming)
@@ -508,6 +541,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--env", default=".env", help="путь к файлу .env (по умолчанию .env)"
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="отладочные логи")
+    parser.add_argument(
+        "--log-file",
+        default=os.environ.get("SIPBOT_LOG_FILE") or None,
+        help="дописать лог в файл (UTF-8); env SIPBOT_LOG_FILE",
+    )
+    parser.add_argument(
+        "--metrics-file",
+        default=os.environ.get("SIPBOT_METRICS_FILE") or None,
+        help="писать метрики задержек в JSONL; env SIPBOT_METRICS_FILE",
+    )
+
     sub = parser.add_subparsers(dest="command", required=True)
 
     reg = sub.add_parser("register", help="только регистрация на SIP-сервере")
@@ -613,7 +657,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
-    setup_logging(args.verbose)
+    setup_logging(args.verbose, args.log_file)
     try:
         settings = load_settings(args)
         return args.func(settings, args)

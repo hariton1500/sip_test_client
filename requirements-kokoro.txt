@@ -1,0 +1,18 @@
+# Опциональный локальный TTS kokoro-ru (TTS_PROVIDER=kokoro|auto).
+# Основной сценарий (TTS_PROVIDER=cloud) эти пакеты не требует.
+#
+# Установка: python -m pip install -r requirements-kokoro.txt
+# Модель (~140 МБ q8 + голоса + данные espeak) скачивается при первом запуске
+# в KOKORO_MODEL_DIR (по умолчанию cache/kokoro-ru).
+-r requirements.txt
+
+onnxruntime>=1.17
+huggingface_hub>=0.23
+# RUAccent ставит ударения; тянет onnxruntime, transformers, razdel и т.п.
+ruaccent>=1.5.8
+# Фонемизация через espeak-ng. На Windows нужен рабочий espeak-ng:
+# либо системная установка, либо пакет espeakng-loader.
+phonemizer>=3.2
+misaki>=0.9
+# espeak-ng как разделяемая библиотека (особенно важно на Windows).
+espeakng-loader>=0.2

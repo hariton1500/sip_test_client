@@ -26,6 +26,7 @@ from pyVoIP.VoIP import CallState, VoIPCall
 from .bots import Bot
 from .config import Settings
 from .media import MediaBridge, Recorder
+from .metrics import MetricsWriter, format_report, summarize_reports
 from .phone import SipPhone
 
 logger = logging.getLogger(__name__)
@@ -97,12 +98,14 @@ class CallSession:
         bot: Optional[Bot] = None,
         recorder: Optional[Recorder] = None,
         on_finished: Optional[Callable[["CallSession"], None]] = None,
+        metrics: Optional[MetricsWriter] = None,
     ) -> None:
         self.call = call
         self.phone = phone
         self.bot = bot
         self.recorder = recorder
         self.on_finished = on_finished
+        self.metrics = metrics
         self.info = caller_info(call)
         self.started_at: Optional[float] = None
         self.ended_at: Optional[float] = None
@@ -222,6 +225,14 @@ class CallSession:
                 self.bot.close()
             except Exception:  # noqa: BLE001
                 logger.exception("Ошибка закрытия бота")
+            reports = list(getattr(self.bot, "latency_reports", ()) or ())
+            if reports:
+                logger.info(
+                    "Сводка задержек: %s",
+                    format_report(summarize_reports(reports), compact=True),
+                )
+                if self.metrics is not None:
+                    self.metrics.write_all(reports)
 
         # Если звонок всё ещё не сброшен — принудительно положим трубку.
         try:
@@ -246,11 +257,13 @@ class IncomingDispatcher:
         settings: Settings,
         bot_factory: Callable[[], Optional[Bot]],
         record_dir: Optional[PathLike] = None,
+        metrics: Optional[MetricsWriter] = None,
     ) -> None:
         self.phone = phone
         self.settings = settings
         self.bot_factory = bot_factory
         self.record_dir = Path(record_dir) if record_dir else None
+        self.metrics = metrics
         self._sessions: Dict[str, CallSession] = {}
         self._lock = threading.RLock()
 
@@ -315,6 +328,7 @@ class IncomingDispatcher:
             bot=bot,
             recorder=recorder,
             on_finished=self._on_session_finished,
+            metrics=self.metrics,
         )
 
     def _on_session_finished(self, session: CallSession) -> None:

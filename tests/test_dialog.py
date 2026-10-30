@@ -241,6 +241,38 @@ def test_dialog_calls_billing_tool_and_passes_result_to_llm():
     assert bot.last_latency.text.startswith("На вашем счёте")
 
 
+def test_dialog_records_llm_rounds_and_tts_chunks():
+    """Детализация: раунды LLM (tool-цикл) и предложения TTS попадают в отчёт."""
+    ai = ToolAi(
+        "get_billing_info",
+        '{"account_id":"20"}',
+        "Первое предложение ответа. Второе предложение ответа.",
+    )
+    bot = DialogBot(
+        ai,
+        "system",
+        config=_config(),
+        vad=EnergyVAD(speech_ms=20, silence_ms=20, max_utterance_ms=500),
+        tts=FakeTts(),
+        billing=FakeBilling(),
+    )
+
+    bot.on_call_started("caller", "call-details")
+    bot.on_frame(tone_u8(440, 20, amplitude=0.5))
+    bot.on_frame(SILENCE_FRAME)
+    assert _wait_for(lambda: len(bot.latency_reports) == 1)
+    bot.close()
+
+    report = bot.last_latency
+    assert report is not None
+    assert len(report.llm_rounds_ms) == 2
+    assert all(value >= 0 for value in report.llm_rounds_ms)
+    assert report.tool_ms >= 0
+    assert len(report.tts_chunks_ms) == 2
+    assert report.tts_first_chunk_ms == report.tts_chunks_ms[0]
+    assert report.tts_ms >= sum(report.tts_chunks_ms)
+
+
 def test_dialog_end_call_reports_ready_only_after_audio_played():
     ai = ToolAi("end_call", "{}", "Всего доброго!")
     bot = DialogBot(

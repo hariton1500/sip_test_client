@@ -19,7 +19,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Mapping, Optional
+from typing import Any, Deque, Dict, List, Mapping, Optional, Tuple
 
 from .audio_utils import FRAME_BYTES, SILENCE_BYTE, iter_frames
 from .billing import BillingClient, BillingError
@@ -247,6 +247,12 @@ class LatencyReport:
     # Время от конца речи до первого готового аудио. При синтезе по
     # предложениям меньше total_ms, потому что second sentence ещё считается.
     first_audio_ms: float = 0.0
+    # Детализация: сколько занял каждый раунд LLM (tool-цикл) и каждое
+    # предложение TTS. llm_ms — их сумма, tts_ms — сумма чанков.
+    llm_rounds_ms: Tuple[float, ...] = ()
+    tool_ms: float = 0.0
+    tts_chunks_ms: Tuple[float, ...] = ()
+    tts_first_chunk_ms: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -258,6 +264,10 @@ class LatencyReport:
             "queue_ms": round(self.queue_ms, 1),
             "total_ms": round(self.total_ms, 1),
             "first_audio_ms": round(self.first_audio_ms, 1),
+            "llm_rounds_ms": [round(value, 1) for value in self.llm_rounds_ms],
+            "tool_ms": round(self.tool_ms, 1),
+            "tts_chunks_ms": [round(value, 1) for value in self.tts_chunks_ms],
+            "tts_first_chunk_ms": round(self.tts_first_chunk_ms, 1),
         }
 
 
@@ -409,7 +419,8 @@ class DialogBot:
                         if info is not None
                         else self._vad.silence_ms
                     )
-                    speech_end = time.monotonic() - trailing_ms / 1000.0
+                    # perf_counter, чтобы метрики и очередь были в одной шкале.
+                    speech_end = time.perf_counter() - trailing_ms / 1000.0
                     if info is not None:
                         logger.info(
                             "VAD [%s]: речь %.2f с, WAV %.2f с, хвост %.2f с "
@@ -529,7 +540,7 @@ class DialogBot:
                     if info is not None
                     else self._vad.silence_ms
                 )
-                speech_end = time.monotonic() - trailing_ms / 1000.0
+                speech_end = time.perf_counter() - trailing_ms / 1000.0
                 if info is not None:
                     logger.info(
                         "VAD [%s]: финальная речь %.2f с, WAV %.2f с (%s)",
@@ -769,11 +780,37 @@ class DialogBot:
         logger.warning("LLM вызвал неизвестный инструмент: %r", name)
         return {"error": f"Неизвестный инструмент: {name}"}
 
-    def _chat_with_tools(self, messages: List[Dict[str, Any]]) -> Any:
-        """Выполнить tool-calls LLM и вернуть финальный ответ."""
+    @staticmethod
+    def _store_llm_stats(
+        stats: Optional[Dict[str, Any]],
+        rounds_ms: List[float],
+        tools_ms: List[float],
+    ) -> None:
+        if stats is None:
+            return
+        stats["rounds_ms"] = list(rounds_ms)
+        stats["tools_ms"] = list(tools_ms)
+        stats["tool_ms"] = sum(tools_ms)
+
+    def _chat_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        stats: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Выполнить tool-calls LLM и вернуть финальный ответ.
+
+        Если передан ``stats``, заполняет ``rounds_ms`` (время каждого
+        chat-запроса) и ``tools_ms`` (время каждого инструмента), чтобы
+        в отчёте отделить сеть LLM от биллинга.
+        """
+        rounds_ms: List[float] = []
+        tools_ms: List[float] = []
         for round_index in range(self.config.max_tool_rounds):
+            chat_started = time.perf_counter()
             response = self.ai.chat(messages, tools=self._tools)
+            rounds_ms.append((time.perf_counter() - chat_started) * 1000.0)
             if not response.has_tool_calls:
+                self._store_llm_stats(stats, rounds_ms, tools_ms)
                 return response
 
             tool_calls = response.tool_calls or []
@@ -787,7 +824,9 @@ class DialogBot:
             for index, tool_call in enumerate(tool_calls):
                 function = tool_call.get("function") or {}
                 name = str(function.get("name") or "")
+                tool_started = time.perf_counter()
                 result = self._execute_tool_call(tool_call)
+                tools_ms.append((time.perf_counter() - tool_started) * 1000.0)
                 messages.append(
                     {
                         "role": "tool",
@@ -814,7 +853,11 @@ class DialogBot:
             self.config.max_tool_rounds,
             self._call_id,
         )
-        return self.ai.chat(messages)
+        chat_started = time.perf_counter()
+        response = self.ai.chat(messages)
+        rounds_ms.append((time.perf_counter() - chat_started) * 1000.0)
+        self._store_llm_stats(stats, rounds_ms, tools_ms)
+        return response
 
     def _process(self, utterance: _Utterance) -> None:
         # Та же шкала, что и ``queued_at``: иначе очередь считается по нулю.
@@ -861,15 +904,16 @@ class DialogBot:
         if self._abort_if_superseded(utterance, "LLM"):
             return
 
-        llm_started = time.monotonic()
+        llm_started = time.perf_counter()
+        llm_stats: Dict[str, Any] = {}
         try:
-            response = self._chat_with_tools(self._messages())
+            response = self._chat_with_tools(self._messages(), stats=llm_stats)
             content = (getattr(response, "content", "") or "").strip()
         except Exception as exc:  # noqa: BLE001
             logger.exception("Ошибка LLM [%s]", self._call_id)
             self._publish(SYSTEM, f"Ошибка LLM: {exc}")
             content = self.config.fallback_reply
-        llm_ms = (time.monotonic() - llm_started) * 1000.0
+        llm_ms = (time.perf_counter() - llm_started) * 1000.0
 
         content = self._prepare_reply(content)
         if not content and self._end_call_requested:
@@ -893,15 +937,18 @@ class DialogBot:
 
         # Синтезируем по предложениям и отдаём первое сразу: для телефонии
         # важен time-to-first-audio, а не общая длительность синтеза.
-        tts_started = time.monotonic()
+        tts_started = time.perf_counter()
         first_audio_ms = 0.0
+        tts_chunks_ms: List[float] = []
         for chunk in self._reply_chunks(content):
+            chunk_started = time.perf_counter()
             try:
                 audio = self._tts.audio_u8(chunk)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Ошибка TTS [%s]", self._call_id)
                 self._publish(SYSTEM, f"Ошибка синтеза речи: {exc}")
                 return
+            tts_chunks_ms.append((time.perf_counter() - chunk_started) * 1000.0)
             with self._lock:
                 reason = self._superseded_reason_locked(utterance)
                 if reason is not None:
@@ -910,11 +957,11 @@ class DialogBot:
                 self._enqueue_audio(audio)
                 if not first_audio_ms:
                     first_audio_ms = (
-                        time.monotonic() - utterance.speech_end
+                        time.perf_counter() - utterance.speech_end
                     ) * 1000.0
-        tts_ms = (time.monotonic() - tts_started) * 1000.0
+        tts_ms = (time.perf_counter() - tts_started) * 1000.0
 
-        total_ms = (time.monotonic() - utterance.speech_end) * 1000.0
+        total_ms = (time.perf_counter() - utterance.speech_end) * 1000.0
         report = LatencyReport(
             call_id=self._call_id,
             text=content,
@@ -924,6 +971,10 @@ class DialogBot:
             total_ms=total_ms,
             queue_ms=queue_ms,
             first_audio_ms=first_audio_ms,
+            llm_rounds_ms=tuple(llm_stats.get("rounds_ms") or ()),
+            tool_ms=float(llm_stats.get("tool_ms") or 0.0),
+            tts_chunks_ms=tuple(tts_chunks_ms),
+            tts_first_chunk_ms=tts_chunks_ms[0] if tts_chunks_ms else 0.0,
         )
         with self._lock:
             self._reports.append(report)
@@ -937,6 +988,16 @@ class DialogBot:
             tts_ms / 1000.0,
             first_audio_ms / 1000.0,
             total_ms / 1000.0,
+        )
+        logger.info(
+            "Детали задержек [%s]: LLM раунды=[%s] мс, тулы=[%s] мс, "
+            "TTS предложения=[%s] мс",
+            self._call_id,
+            ", ".join(f"{value:.1f}" for value in report.llm_rounds_ms),
+            ", ".join(
+                f"{value:.1f}" for value in (llm_stats.get("tools_ms") or ())
+            ),
+            ", ".join(f"{value:.1f}" for value in report.tts_chunks_ms),
         )
 
     def _messages(self) -> List[Dict[str, str]]:

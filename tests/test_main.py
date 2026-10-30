@@ -210,3 +210,81 @@ def test_wav_bot_has_lifecycle_hooks():
     """run_call зовёт on_call_started/on_call_ended у любого бота."""
     assert hasattr(WavFileBot, "on_call_started")
     assert hasattr(WavFileBot, "on_call_ended")
+
+
+# ----------------------------------------------------------------------
+# Логи и метрики задержек
+# ----------------------------------------------------------------------
+def test_setup_logging_writes_utf8_file(tmp_path):
+    import logging
+
+    log_path = tmp_path / "logs" / "call.log"
+    root = logging.getLogger()
+    original_handlers = list(root.handlers)
+    original_level = root.level
+
+    main.setup_logging(False, str(log_path))
+    try:
+        logging.getLogger("sipbot.test").info("Проверка UTF-8: задержка")
+        for handler in root.handlers:
+            handler.flush()
+        text = log_path.read_text(encoding="utf-8")
+    finally:
+        for handler in list(root.handlers):
+            if handler not in original_handlers:
+                root.removeHandler(handler)
+                handler.close()
+        for handler in original_handlers:
+            if handler not in root.handlers:
+                root.addHandler(handler)
+        root.setLevel(original_level)
+
+    assert "Проверка UTF-8" in text
+
+
+def test_log_latency_summary_writes_jsonl(tmp_path):
+    from sipbot.metrics import LatencySample
+
+    writer = main.MetricsWriter(tmp_path / "metrics.jsonl")
+    bot = SimpleNamespace(
+        latency_reports=[
+            LatencySample(
+                call_id="call-1",
+                asr_ms=100.0,
+                llm_ms=200.0,
+                tts_ms=300.0,
+                total_ms=600.0,
+            )
+        ]
+    )
+
+    main.log_latency_summary(bot, writer)
+
+    lines = writer.path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert '"call_id": "call-1"' in lines[0]
+    assert '"total_ms": 600.0' in lines[0]
+
+
+def test_log_latency_summary_skips_bots_without_metrics(tmp_path):
+    writer = main.MetricsWriter(tmp_path / "metrics.jsonl")
+
+    main.log_latency_summary(SimpleNamespace(), writer)
+
+    assert not writer.path.exists()
+
+
+def test_metrics_and_log_file_defaults_come_from_env(monkeypatch):
+    monkeypatch.delenv("SIPBOT_LOG_FILE", raising=False)
+    monkeypatch.delenv("SIPBOT_METRICS_FILE", raising=False)
+    args = main.build_parser().parse_args(["dial", "+79780481885"])
+    assert args.log_file is None and args.metrics_file is None
+    assert main.metrics_writer_for(args) is None
+
+    monkeypatch.setenv("SIPBOT_LOG_FILE", "call.log")
+    monkeypatch.setenv("SIPBOT_METRICS_FILE", "metrics.jsonl")
+    args = main.build_parser().parse_args(["dial", "+79780481885"])
+
+    assert args.log_file == "call.log"
+    assert args.metrics_file == "metrics.jsonl"
+    assert main.metrics_writer_for(args).path.name == "metrics.jsonl"

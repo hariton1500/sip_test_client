@@ -356,6 +356,15 @@ BILLING_TIMEOUT=10
 | `TTS_SAMPLE_RATE` | `24000` | частота raw PCM от TTS до ресемплинга в 8 кГц |
 | `TTS_TIMEOUT` | `20` | таймаут одного запроса TTS, с |
 | `TTS_CACHE_DIR` | `cache/tts` | дисковый кэш WAV; пустое значение отключает кэш |
+| `TTS_PROVIDER` | `cloud` | `cloud` — Gemini через API, `kokoro` — локальный kokoro-ru, `auto` — локальный с откатом на облачный |
+| `KOKORO_MODEL_DIR` | `cache/kokoro-ru` | куда скачивается ONNX-модель, голоса и данные espeak |
+| `KOKORO_REPO` | `zaakirio/kokoro-ru` | HuggingFace-репозиторий модели |
+| `KOKORO_MODEL_FILE` | `onnx/model_quantized.onnx` | q8-модель (~138 МБ); `onnx/model.onnx` — fp32 (~326 МБ) |
+| `KOKORO_VOICE` | `sveta` | голос: `sveta`, `masha` (женские), `dima` (мужской) |
+| `KOKORO_THREADS` | `2` | потоки ONNX на CPU; больше — быстрее одна реплика, но выше нагрузка на линиях |
+| `KOKORO_SPEED` | `1.0` | темп речи (0.1–2.0) |
+| `KOKORO_DOWNLOAD` | `1` | скачивать модель при старте; `0` — работать только из `KOKORO_MODEL_DIR` |
+| `KOKORO_ESPEAK_DATA` | `<KOKORO_MODEL_DIR>/espeak-data` | путь к данным espeak-ng с русскими ударениями |
 | `AI_GREETING` | встроенная фраза | TTS-приветствие в начале звонка; пусто — без приветствия |
 | `AI_FALLBACK_REPLY` | «Извините…» | фраза при ошибке LLM |
 | `VAD_SPEECH_MS` | `200` | сколько речи подтверждает начало реплики |
@@ -398,6 +407,56 @@ Barge-in работает по энергии входящего сигнала.
 
 Если `OPENAI_BASE_URL`/`OPENAI_API_KEY` (или их `AI_*` синонимы) не заданы,
 ASR/LLM/TTS отключаются; `incoming --ui` работает, но без расшифровки.
+
+### Локальный TTS kokoro-ru
+
+По умолчанию TTS остаётся облачным. Локальный провайдер включается одной
+переменной и не требует менять диалоговый код: `TtsService`, кэш, ресемплинг
+в 8 кГц и метрики задержек те же.
+
+```powershell
+python -m pip install -r requirements-kokoro.txt
+# в .env:
+#   TTS_PROVIDER=kokoro
+#   KOKORO_VOICE=sveta
+python main.py incoming --bot auto --ui
+```
+
+Как это работает:
+
+* `sipbot/tts_provider.py` выбирает провайдера (`cloud`/`kokoro`/`auto`);
+  `auto` при ошибке локального синтеза откатывается на Gemini и пишет
+  предупреждение в лог;
+* `sipbot/tts_kokoro.py` при первом запуске скачивает q8-модель, выбранный
+  голос и `espeak-data` в `KOKORO_MODEL_DIR` (нужен интернет один раз),
+  затем работает офлайн;
+* `sipbot/ru_text.py` нормализует ответ LLM: числа, суммы, проценты, номера
+  лицевых счетов, `л/с`, `т.д.`, markdown, латиница и аббревиатуры. Без этого
+  слоя модель читает цифры и латиницу непредсказуемо;
+* длинный текст режется по предложениям (до 300 символов), куски склеиваются
+  с паузой 60 мс; ONNX-сессия одна на процесс, синтез сериализован, потому что
+  G2P (RUAccent + espeak) не потокобезопасен.
+
+Ограничения и эксплуатация:
+
+* пик RAM ~2.4 ГБ, RTF ~0.1 на CPU (реплика на 2 с синтезируется ~0.2 с);
+  при нескольких линиях держите `KOKORO_THREADS=2`, иначе процессор уйдёт в
+  потолок;
+* у модели три голоса и детерминированная просодия; русские ударения
+  расставляет RUAccent (омографы не идеальны), поэтому критичные фразы лучше
+  проверять на слух или задавать текстом без омографов;
+* на Windows для `phonemizer` нужен рабочий espeak-ng: системная установка
+  либо пакет `espeakng-loader`;
+* веса `kokoro-ru` распространяются по OpenRAIL — перед коммерческим
+  использованием проверьте ограничения лицензии;
+* если локальный TTS не нужен, не устанавливайте `requirements-kokoro.txt`:
+  импорты ленивые, облачный режим работает на базовых зависимостях.
+
+Проверить локальный синтез отдельно, без SIP:
+
+```powershell
+python -c "from sipbot.tts_kokoro import KokoroTts; from sipbot.tts import TtsService; t=TtsService(KokoroTts.from_env()); print(len(t.audio_u8('Здравствуйте! Баланс 1500 рублей.')))"
+```
 
 ### Быстрый набор моделей для телефонии
 
@@ -447,13 +506,15 @@ AITUNNEL не поддерживает — там важна только мод
 ### `main.py`: общие ключи
 
 ```powershell
-python main.py [--env FILE] [-v|--verbose] <команда> [ключи]
+python main.py [--env FILE] [-v|--verbose] [--log-file FILE] [--metrics-file FILE] <команда> [ключи]
 ```
 
 | Ключ | По умолчанию | Назначение |
 |---|---|---|
 | `--env FILE` | `.env` | путь к файлу с настройками |
 | `-v`, `--verbose` | выкл. | отладочные логи (DEBUG) |
+| `--log-file FILE` | нет (`SIPBOT_LOG_FILE`) | дописать весь лог в файл (UTF-8) |
+| `--metrics-file FILE` | нет (`SIPBOT_METRICS_FILE`) | писать метрики задержек в JSONL |
 
 Общие ключи указываются **до** команды, например:
 `python main.py --env .env.test -v register`.
@@ -719,6 +780,50 @@ python scripts/sip_trace.py 15 --rtp
 python scripts/sip_trace.py 30 --debug --stack
 ```
 
+## Метрики задержек
+
+Каждый ответ AI-бота пишет в лог две строки:
+
+* `Задержка ответа [call-id]: очередь …, ASR …, LLM …, TTS …, первый звук …,
+  всего от конца речи …` — сводка по реплике (формат не менялся);
+* `Детали задержек [call-id]: LLM раунды=[…] мс, тулы=[…] мс,
+  TTS предложения=[…] мс` — разбивка LLM по раундам tool-цикла и TTS по
+  предложениям.
+
+В конце звонка печатается `Сводка задержек: …` с медианой и p90 по этапам.
+`LLM` — это весь `_chat_with_tools` (включая раунды с инструментами), `TTS` —
+сумма синтеза всех предложений, а `первый звук`/`всего` считаются от конца речи,
+поэтому включают паузу VAD на тишину (`VAD_SILENCE_MS`, по умолчанию 600 мс).
+
+Чтобы сохранить метрики в файлы:
+
+```powershell
+python main.py dial +79780481885 --bot ai --duration 60 `
+  --record rx_ai.wav --log-file logs/call.log --metrics-file logs/metrics.jsonl
+```
+
+| Ключ | env | Назначение |
+|---|---|---|
+| `--log-file FILE` | `SIPBOT_LOG_FILE` | дописать весь лог в файл (UTF-8) |
+| `--metrics-file FILE` | `SIPBOT_METRICS_FILE` | JSONL: по строке на реплику |
+
+Оба ключа общие (указываются до подкоманды) и работают для `dial`, `listen` и
+`incoming`. Без них файлы не создаются, консольный вывод не меняется.
+
+Отчёт по накопленным данным:
+
+```powershell
+python scripts/latency_report.py logs/metrics.jsonl --details
+python scripts/latency_report.py logs/call.log --last 20
+python scripts/latency_report.py logs/*.log --json
+type logs\call.log | python scripts/latency_report.py -
+```
+
+Формат определяется по содержимому (JSONL или текстовый лог), битые строки
+пропускаются. `--details` добавляет разбивку «LLM по раундам» и «TTS по
+предложениям», `--last N` оставляет только последние N реплик, `--json` отдаёт
+агрегаты для внешних скриптов.
+
 ## Структура проекта
 
 ```
@@ -734,7 +839,11 @@ sipbot/vad.py           EnergyVAD: сегментация речи для ASR и
 sipbot/transcript.py    TranscriptStore: история реплик + подписки для UI
 sipbot/transcribing_bot.py  обёртка обычного бота: VAD -> ASR -> лента разговора
 sipbot/dialog.py        DialogBot: VAD -> ASR -> LLM -> TTS, история, метрики
+sipbot/metrics.py       разбор логов/JSONL, агрегаты (медиана, p90) и отчёт
 sipbot/tts.py           TtsService: raw PCM/WAV -> ФНЧ -> 8 кГц, обрезка тишины, кэш
+sipbot/tts_kokoro.py    локальный TTS kokoro-ru: ONNX, G2P, загрузка модели
+sipbot/tts_provider.py  выбор cloud/kokoro/auto + откат на облачный TTS
+sipbot/ru_text.py       нормализация русского текста для локального TTS
 sipbot/prompts.py       безопасное чтение/создание/атомарное сохранение промптов
 sipbot/prompt_ui_server.py  HTTP-сервер редактора промптов
 sipbot/prompt_ui/index.html страница редактора с Markdown-просмотром
@@ -747,7 +856,8 @@ scripts/offline_smoke.py  оффлайн-проверка моста и запи
 scripts/live_incoming.py  живой harness: локальная АТС + один входящий звонок
 scripts/prompt_editor.py  отдельный запуск веб-редактора промптов
 scripts/sip_trace.py    трассировка SIP/RTP по сокетам (диагностика live-тестов)
-tests/                  184 теста без сети: аудио, боты, диалог, TTS, мост, UI
+scripts/latency_report.py  отчёт по задержкам из call.log или metrics.jsonl
+tests/                  243 теста без сети: аудио, боты, диалог, TTS, мост, UI
 ```
 
 ### Как устроен обмен звуком
